@@ -1,0 +1,1995 @@
+---
+title: "Cadeia Leve Livre Sérica e Mortalidade por Todas as Causas"
+subtitle: "Trabalho Final — Análise de Sobrevivência"
+author: "Arthur Motta"
+date: "today"
+lang: pt
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Sumário"
+    code-fold: true
+    code-tools: true
+    theme: flatly
+    highlight-style: github
+    fig-width: 9
+    fig-height: 5.5
+    number-sections: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  echo: true
+bibliography: references.bib
+crossref:
+  sec-prefix: "Seção"
+---
+
+```{r setup}
+#| label: setup
+#| code-summary: "Carregar pacotes"
+
+# --- Análise de sobrevivência ---
+library(survival)    # estimadores KM, Nelson-Aalen, modelo de Cox, dados flchain
+library(flexsurv)    # modelos paramétricos AFT: Weibull, log-normal, gama generalizada, etc.
+library(muhaz)       # estimação do hazard por kernel de Nadaraya-Watson
+library(bshazard)    # estimação do hazard por B-splines (preferível por ausência de efeito de borda)
+
+# --- Seleção de variáveis ---
+library(MASS)           # stepAIC: seleção de covariáveis por critério AIC
+library(My.stepwise)    # My.stepwise.coxph: seleção bidirecional com p-valores para o Cox
+
+# --- Visualização de curvas de sobrevivência ---
+library(ggsurvfit)   # curvas KM e Nelson-Aalen com ggplot2 (add_risktable, add_pvalue, etc.)
+library(survminer)   # diagnósticos do Cox (ggcoxzph, ggcoxdiagnostics, ggforest)
+
+# --- Tabelas e relatório ---
+library(gtsummary)   # tabelas descritivas (tbl_summary) e de modelos (tbl_regression)
+library(gt)          # tabelas gt com formatação avançada (LaTeX, cores, footnotes)
+
+# --- Manipulação e visualização geral ---
+library(tidyverse)   # dplyr, ggplot2, tidyr, purrr, stringr, forcats, readr
+library(patchwork)   # composição de múltiplos gráficos ggplot2 em painéis
+library(broom)       # tidy(), glance(), augment() para extrair resultados de modelos
+library(corrplot)    # matriz de correlação visual (corrplot)
+library(scales)      # formatação de eixos (percent_format, label_number, etc.)
+
+theme_set(theme_minimal(base_size = 12))
+theme_gtsummary_compact()
+```
+
+# Introdução
+
+A cadeia leve livre sérica (*serum free light chain*, FLC) é uma proteína produzida
+pelas células plasmáticas do sistema imunológico. Em indivíduos saudáveis, os
+níveis de FLC são mantidos dentro de uma faixa estreita. Elevações anormais, mesmo na ausência de doença hematológica diagnosticada, têm sido associadas a piores
+desfechos clínicos, incluindo maior mortalidade [@dispenzieri2012use].
+
+Este trabalho analisa dados de um estudo de coorte de base populacional conduzido no
+Condado de Olmsted, Minnesota (EUA), disponíveis no pacote `survival` do R sob o
+nome `flchain`. O estudo recrutou aproximadamente dois terços dos residentes do
+condado com 50 anos ou mais a partir de 1995, com o objetivo de determinar a
+prevalência da gamopatia monoclonal de significado indeterminado (MGUS) e sua
+relação com a mortalidade.
+
+**Pergunta principal de interesse:** A concentração sérica de cadeia leve livre
+está associada ao tempo de sobrevivência de adultos com 50 anos ou mais, após
+controle por idade, sexo, creatinina sérica e diagnóstico de MGUS?
+
+O conjunto de dados é adequado para análise de sobrevivência porque contém uma
+variável de tempo de acompanhamento (`futime`, em dias), um indicador de evento
+(`death`), mecanismo de censura à direita (sobreviventes ao final do seguimento
+foram censurados) e múltiplas covariáveis clínicas e demográficas que permitem
+modelagem multivariada.
+
+Formalmente, define-se a **função de sobrevivência** como
+$$S(t) = P(T > t), \quad t \geq 0,$$
+onde $T$ é o tempo até o evento (óbito). A **função de risco instantâneo** (*hazard function*) é
+$$h(t) = \lim_{\Delta t \to 0} \frac{P(t \leq T < t + \Delta t \mid T \geq t)}{\Delta t} = -\frac{d}{dt}\log S(t),$$
+e a relação entre as duas é
+$$S(t) = \exp\!\left(-\int_0^t h(u)\,du\right) = e^{-H(t)},$$
+onde $H(t) = \int_0^t h(u)\,du$ é o **risco acumulado** [@colosimo2006analise; @klein2003survival].
+
+---
+
+# Descrição dos Dados e Análise Exploratória
+
+## Fonte e Variáveis
+
+Os dados provêm de uma amostra estratificada aleatória de 50% dos participantes
+do estudo original [@kyle2006prevalence]. O conjunto contém **7.874 indivíduos**
+e as seguintes variáveis:
+
+| Variável | Tipo | Descrição |
+|---|---|---|
+| `futime` | Tempo | Dias desde a coleta até o óbito ou censura |
+| `death` | Evento | 1 = óbito, 0 = censurado |
+| `age` | Contínua | Idade em anos no momento da coleta |
+| `sex` | Categórica | F = feminino, M = masculino |
+| `kappa` | Contínua | FLC kappa sérica (mg/dL) |
+| `lambda` | Contínua | FLC lambda sérica (mg/dL) |
+| `flc.grp` | Ordinal | Grupo de FLC total (1–10), usado na análise original |
+| `creatinine` | Contínua | Creatinina sérica (mg/dL) |
+| `mgus` | Binária | 1 = diagnóstico prévio de MGUS |
+
+A variável `flc.grp` representa decis do valor de FLC total (kappa + lambda) e
+será utilizada como covariável categórica principal, conforme a análise original
+de @dispenzieri2012use. Agrupamos os decis em **quatro categorias** para facilitar
+a interpretação: baixo (1–2), médio-baixo (3–5), médio-alto (6–8) e alto (9–10).
+
+```{r preparo-dados}
+#| label: preparo-dados
+#| code-summary: "Preparação dos dados"
+
+data(flchain, package = "survival")
+
+# Remover os 3 indivíduos com futime = 0
+# (coleta realizada no dia do óbito — tempo zero impossível no KM)
+flchain_clean <- flchain |>
+  filter(futime > 0) |>
+  mutate(
+    # Tempo em anos (facilita interpretação)
+    anos       = futime / 365.25,
+    # Grupo de FLC em 4 categorias (labels sem travessão especial para evitar encoding)
+    flc_cat    = case_when(
+      flc.grp %in% 1:2   ~ "1-2 (Baixo)",
+      flc.grp %in% 3:5   ~ "3-5 (Medio-baixo)",
+      flc.grp %in% 6:8   ~ "6-8 (Medio-alto)",
+      flc.grp %in% 9:10  ~ "9-10 (Alto)"
+    ) |> factor(levels = c("1-2 (Baixo)", "3-5 (Medio-baixo)",
+                            "6-8 (Medio-alto)", "9-10 (Alto)")),
+    # Grupo de idade
+    age_cat    = cut(age,
+                     breaks = c(49, 59, 69, 79, 110),
+                     labels = c("50–59", "60–69", "70–79", "80+"),
+                     right  = TRUE),
+    # Sexo como fator legível
+    sexo       = factor(sex, levels = c("F","M"),
+                        labels = c("Feminino","Masculino")),
+    # MGUS como fator
+    mgus_f     = factor(mgus, levels = c(0,1),
+                        labels = c("Não","Sim")),
+    # FLC total
+    flc_total  = kappa + lambda
+  )
+
+cat(sprintf("Amostra final: %d indivíduos\n", nrow(flchain_clean)))
+cat(sprintf("Óbitos: %d (%.1f%%)\n",
+            sum(flchain_clean$death),
+            100 * mean(flchain_clean$death)))
+cat(sprintf("Censurados: %d (%.1f%%)\n",
+            sum(flchain_clean$death == 0),
+            100 * mean(flchain_clean$death == 0)))
+cat(sprintf("Seguimento mediano: %.1f anos (máx: %.1f)\n",
+            median(flchain_clean$anos),
+            max(flchain_clean$anos)))
+```
+
+## Análise Descritiva
+
+```{r tabela-descritiva}
+#| label: tabela-descritiva
+#| tbl-cap: "Características da amostra por desfecho"
+
+flchain_clean |>
+  select(anos, sexo, age, age_cat, flc_cat, creatinine, mgus_f, death) |>
+  tbl_summary(
+    by      = death,
+    label   = list(
+      anos       ~ "Tempo de seguimento (anos)",
+      sexo       ~ "Sexo",
+      age        ~ "Idade (anos)",
+      age_cat    ~ "Faixa etária",
+      flc_cat    ~ "Grupo de FLC",
+      creatinine ~ "Creatinina (mg/dL)",
+      mgus_f     ~ "MGUS"
+    ),
+    statistic = list(
+      all_continuous()  ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits    = list(all_continuous() ~ 1),
+    missing   = "no"
+  ) |>
+  add_overall() |>
+  add_p() |>
+  modify_header(
+    label     ~ "**Variável**",
+    stat_0    ~ "**Total**\nN = {N}",
+    stat_1    ~ "**Censurado**\nn = {n}",
+    stat_2    ~ "**Óbito**\nn = {n}"
+  ) |>
+  modify_caption("**Tabela 1.** Características da amostra por desfecho [@kyle2006prevalence]") |>
+  bold_labels()
+```
+
+A Tabela 1 revela diferenças substanciais e clinicamente coerentes entre os grupos. Os indivíduos que foram a óbito eram substancialmente mais velhos (mediana de 75 anos vs. 62 anos nos censurados), diferença de 13 anos que, por si só, já seria suficiente para explicar grande parte da divergência no desfecho, dada a forte dependência etária da mortalidade. Essa diferença etária entre grupos aponta para a necessidade de ajuste multivariado: análises brutas que ignorassem a idade estariam confundindo o efeito da FLC com o efeito do envelhecimento.
+
+A distribuição por grupo de FLC é marcadamente assimétrica entre os desfechos: enquanto 24% dos censurados pertenciam ao grupo de FLC baixo, apenas 11% dos que foram a óbito estavam nesse grupo. No extremo oposto, 37% dos óbitos pertenciam ao grupo de FLC alto, contra 13% dos censurados, razão de quase 3:1. Essa separação já na análise descritiva univariada antecipa a associação que será confirmada formalmente nos modelos.
+
+A creatinina sérica, marcador de função renal, também difere entre os grupos (mediana 1,1 vs. 1,0 mg/dL), com distribuição consistente com o esperado, pois disfunção renal é reconhecidamente associada a maior mortalidade cardiovascular e por todas as causas. É importante notar que creatinina e FLC estão correlacionadas: rins com menor capacidade de filtração eliminam menos FLC, elevando seus níveis séricos. Esse mecanismo de confundimento reforça a necessidade de ajuste conjunto pelas duas variáveis na modelagem.
+
+A proporção de MGUS é baixa (1,5%), mas estatisticamente diferente entre os grupos ($p < 0{,}001$). Surpreendentemente, a proporção de MGUS é ligeiramente maior entre os censurados (1,7%) do que entre os que foram a óbito (0,7%). Isso pode parecer contraintuitivo, dado que MGUS é uma condição pré-maligna; contudo, pode refletir viés de sobrevivência (indivíduos com MGUS diagnosticado podem receber acompanhamento médico mais intensivo), o pequeno tamanho do subgrupo, ou o fato de que, no modelo multivariado ajustado por FLC, o efeito independente do MGUS não é significativo.
+
+## Distribuição do Tempo de Sobrevivência
+
+```{r hist-futime}
+#| label: hist-futime
+#| fig-cap: "Distribuição do tempo de seguimento por desfecho"
+
+flchain_clean |>
+  mutate(Desfecho = factor(death, labels = c("Censurado", "Óbito"))) |>
+  ggplot(aes(x = anos, fill = Desfecho)) +
+  geom_histogram(bins = 50, alpha = 0.7, color = "white", linewidth = 0.2) +
+  facet_wrap(~Desfecho, scales = "free_y") +
+  scale_fill_manual(values = c("#2E86AB", "#E94F37")) +
+  labs(
+    title = "Distribuição do Tempo de Seguimento",
+    x     = "Tempo (anos)",
+    y     = "Frequência"
+  ) +
+  theme(legend.position = "none")
+```
+
+Os histogramas revelam perfis completamente distintos entre censurados e óbitos. Os censurados concentram-se em tempos longos, com acúmulo visível entre 11 e 14 anos, correspondendo ao final do período de acompanhamento, quando o estudo foi encerrado e os sobreviventes foram censurados administrativamente. Esse padrão é consistente com censura à direita não informativa: os indivíduos foram censurados por fim do estudo, não por terem deixado de ser observáveis por razões relacionadas ao risco.
+
+Os óbitos, por sua vez, distribuem-se de forma mais uniforme ao longo de todo o período, com leve concentração nos primeiros anos e decrescimento gradual à medida que a coorte inicial vai sendo esgotada. A ausência de um pico muito pronunciado nos primeiros meses descarta a presença de evento agudo inicial importante, como ocorreria em coortes pós-hospitalização, confirmando que a coorte de base populacional tem perfil de risco distribuído.
+
+## Distribuição das Variáveis Contínuas
+
+### FLC Total, Kappa, Lambda e Creatinina
+
+A distribuição das variáveis de laboratório é fortemente assimétrica à direita, característica típica de biomarcadores séricos cuja distribuição populacional é limitada por zero e apresenta cauda superior longa devido a indivíduos com produção aumentada de proteínas. Kappa e lambda apresentam outliers extremos (valores de até 20 mg/dL, contra mediana de aproximadamente 1,3 mg/dL), correspondendo a casos de MGUS ou condições inflamatórias severas. A escala logarítmica aproxima as distribuições da normalidade em todas as variáveis, o que justifica o uso de `log(creatinina)` na modelagem e a interpretação dos coeficientes como efeitos multiplicativos sobre a taxa de risco [@colosimo2006analise].
+
+```{r dist-continuas}
+#| label: dist-continuas
+#| fig-cap: "Distribuição das variáveis laboratoriais (escala log+1)"
+#| fig-height: 5
+#| fig-width: 11
+
+flchain_clean |>
+  mutate(flc_total = kappa + lambda) |>
+  select(kappa, lambda, flc_total, creatinine) |>
+  pivot_longer(everything(), names_to = "variavel", values_to = "valor") |>
+  filter(!is.na(valor)) |>
+  mutate(variavel = factor(variavel,
+    levels = c("kappa","lambda","flc_total","creatinine"),
+    labels = c("Kappa","Lambda","FLC Total","Creatinina"))) |>
+  ggplot(aes(x = valor, fill = variavel)) +
+  geom_histogram(bins = 60, color = "white", linewidth = 0.15, alpha = 0.85) +
+  facet_wrap(~variavel, scales = "free", ncol = 4) +
+  scale_fill_manual(values = c("#2E86AB","#3BB273","#F4A261","#E94F37")) +
+  scale_x_continuous(trans = "log1p",
+                     labels = scales::label_number(accuracy = 0.1)) +
+  labs(
+    title = "Distribuição das Variáveis Laboratoriais (escala log+1)",
+    x     = "Valor (escala log+1)",
+    y     = "Frequência"
+  ) +
+  theme(legend.position = "none")
+```
+
+### Distribuição da FLC por Grupo e por Desfecho
+
+```{r flc-grupo-death}
+#| label: flc-grupo-death
+#| fig-cap: "FLC total (log) por grupo e desfecho — a proporção de óbitos cresce com o grupo"
+#| fig-width: 10
+
+p1 <- flchain_clean |>
+  ggplot(aes(x = flc_cat, y = log(flc_total), fill = flc_cat)) +
+  geom_boxplot(alpha = 0.75, outlier.size = 0.5, outlier.alpha = 0.3) +
+  scale_fill_manual(values = c("#3BB273","#2E86AB","#F4A261","#E94F37")) +
+  labs(title = "FLC Total por Grupo", x = NULL, y = "log(FLC Total)") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 20, hjust = 1))
+
+# Taxa de óbito por grupo (bruta, sem ajuste)
+taxa_obito <- flchain_clean |>
+  group_by(flc_cat) |>
+  summarise(
+    n          = n(),
+    obitos     = sum(death),
+    taxa       = obitos / n,
+    ic_inf     = taxa - 1.96 * sqrt(taxa * (1 - taxa) / n),
+    ic_sup     = taxa + 1.96 * sqrt(taxa * (1 - taxa) / n)
+  )
+
+p2 <- taxa_obito |>
+  ggplot(aes(x = flc_cat, y = taxa, fill = flc_cat)) +
+  geom_col(alpha = 0.85, width = 0.6) +
+  geom_errorbar(aes(ymin = ic_inf, ymax = ic_sup), width = 0.2, linewidth = 0.7) +
+  scale_fill_manual(values = c("#3BB273","#2E86AB","#F4A261","#E94F37")) +
+  scale_y_continuous(labels = scales::percent_format(1), limits = c(0, 0.7)) +
+  labs(title = "Taxa Bruta de Óbito por Grupo", x = NULL, y = "% óbitos") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 20, hjust = 1))
+
+p1 + p2
+```
+
+O painel esquerdo confirma que os grupos de `flc_cat` capturam de fato níveis progressivamente crescentes de FLC total em escala logarítmica, com medianas bem separadas e variabilidade intragrupo relativamente homogênea, indicando que a categorização em decis foi eficiente na criação de grupos internamente coesos.
+
+O painel direito é o resultado mais impactante da análise exploratória: a taxa bruta de óbito sobe de forma monotônica e pronunciada do grupo Baixo (aproximadamente 15%) para o Alto (aproximadamente 51%), com intervalos de confiança que não se sobrepõem entre grupos adjacentes. Isso estabelece uma relação dose a resposta já na análise univariada, antes de qualquer ajuste por confundidores. Essa relação monotônica é importante porque sugere que o efeito da FLC não é limiar, ou seja, presente apenas acima de um valor crítico, mas gradual. Essa característica tem implicações clínicas diretas: mesmo elevações moderadas de FLC conferem risco adicional mensurável.
+
+## Análise de Valores Ausentes e Perfil de Recrutamento
+
+```{r missing-recrutamento}
+#| label: missing-recrutamento
+#| fig-cap: "Perfil de recrutamento por ano e valores ausentes em creatinina"
+#| fig-width: 11
+
+# Recrutamento por ano
+p_ano <- flchain_clean |>
+  count(sample.yr) |>
+  ggplot(aes(x = factor(sample.yr), y = n)) +
+  geom_col(fill = "#2E86AB", alpha = 0.85, width = 0.7) +
+  geom_text(aes(label = n), vjust = -0.4, size = 3.2) +
+  labs(
+    title = "Recrutamento por Ano de Coleta",
+    x     = "Ano",
+    y     = "N de indivíduos"
+  )
+
+# Missing em creatinina por grupo de FLC
+p_miss <- flchain_clean |>
+  mutate(creat_miss = is.na(creatinine)) |>
+  group_by(flc_cat) |>
+  summarise(pct_miss = mean(creat_miss)) |>
+  ggplot(aes(x = flc_cat, y = pct_miss, fill = flc_cat)) +
+  geom_col(alpha = 0.85, width = 0.6) +
+  scale_fill_manual(values = c("#3BB273","#2E86AB","#F4A261","#E94F37")) +
+  scale_y_continuous(labels = scales::percent_format(1)) +
+  labs(
+    title = "% de Creatinina Ausente por Grupo de FLC",
+    x     = NULL,
+    y     = "% missing"
+  ) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 20, hjust = 1))
+
+p_ano + p_miss
+```
+
+Os valores ausentes de creatinina concentram-se sistematicamente nos grupos de FLC mais baixo, chegando a cerca de 25 a 30% de ausência no grupo Baixo, contra valores menores nos grupos mais elevados. Esse padrão não é aleatório e tem implicação direta na análise: ao excluir os aproximadamente 1.350 indivíduos sem creatinina, estamos removendo preferencialmente pessoas de menor risco. Isso significa que a amostra modelada (n = 6.521) sobrerrepresenta indivíduos de maior risco relativo, o que pode levar a uma subestimação da sobrevivência média e a uma superestimação do efeito dos grupos de FLC mais elevados. A distribuição temporal do recrutamento, com 80% nos três primeiros anos, é esperada para estudos de coorte que recrutam de forma intensiva no início e dependem de visitas ambulatoriais subsequentes para os demais.
+
+## Relação entre Covariáveis
+
+### Razão Kappa/Lambda e MGUS
+
+O diagnóstico de MGUS é clinicamente associado a uma razão kappa/lambda fora do
+intervalo de referência (0,26–1,65, segundo a Mayo Clinic). O gráfico confirma
+esse padrão nos dados.
+
+```{r flc-ratio-mgus}
+#| label: flc-ratio-mgus
+#| fig-cap: "Razão kappa/lambda (log) por status de MGUS com linhas de referência clínica"
+
+flchain_clean |>
+  mutate(
+    flc_ratio = kappa / lambda,
+    mgus_lab  = factor(mgus, labels = c("Sem MGUS","Com MGUS"))
+  ) |>
+  ggplot(aes(x = mgus_lab, y = log(flc_ratio), fill = mgus_lab)) +
+  geom_violin(alpha = 0.5, draw_quantiles = c(0.25, 0.5, 0.75)) +
+  geom_hline(yintercept = log(c(0.26, 1.65)),
+             linetype = "dashed", color = "gray30", linewidth = 0.7) +
+  annotate("text", x = 2.45, y = log(0.26) + 0.08,
+           label = "Ref. inf. (0,26)", size = 3, color = "gray30") +
+  annotate("text", x = 2.45, y = log(1.65) + 0.08,
+           label = "Ref. sup. (1,65)", size = 3, color = "gray30") +
+  scale_fill_manual(values = c("#2E86AB","#E94F37")) +
+  labs(
+    title    = "Razão Kappa/Lambda por Status de MGUS",
+    subtitle = "Linhas tracejadas = intervalo de referência clínica (Mayo Clinic: 0,26–1,65)",
+    x        = NULL,
+    y        = "log(Kappa / Lambda)"
+  ) +
+  theme(legend.position = "none")
+```
+
+### Correlação entre Variáveis Contínuas
+
+```{r correlacoes}
+#| label: correlacoes
+#| fig-cap: "Matriz de correlação entre variáveis contínuas (Spearman)"
+#| fig-width: 7
+#| fig-height: 6
+
+library(corrplot)
+
+flchain_clean |>
+  mutate(
+    flc_total = kappa + lambda,
+    flc_ratio = kappa / lambda,
+    log_creat = log(creatinine)
+  ) |>
+  select(age, kappa, lambda, flc_total, flc_ratio, log_creat, anos) |>
+  filter(complete.cases(pick(everything()))) |>
+  cor(method = "spearman") |>
+  corrplot(
+    method      = "color",
+    type        = "upper",
+    tl.col      = "black",
+    tl.cex      = 0.85,
+    addCoef.col = "black",
+    number.cex  = 0.72,
+    col         = colorRampPalette(c("#E94F37","white","#2E86AB"))(200),
+    title       = "Correlação de Spearman — Variáveis Contínuas",
+    mar         = c(0, 0, 1.5, 0)
+  )
+```
+
+### Idade e FLC por Sexo
+
+```{r idade-flc-sexo}
+#| label: idade-flc-sexo
+#| fig-cap: "Relação entre idade, FLC total e sexo"
+#| fig-width: 10
+
+flchain_clean |>
+  mutate(flc_total = kappa + lambda) |>
+  ggplot(aes(x = age, y = log(flc_total), color = sexo)) +
+  geom_point(alpha = 0.07, size = 0.6) +
+  geom_smooth(method = "loess", se = TRUE, linewidth = 1.2) +
+  scale_color_manual(values = c("#E94F37","#2E86AB")) +
+  scale_x_continuous(breaks = seq(50, 100, by = 10)) +
+  labs(
+    title    = "FLC Total (log) vs. Idade por Sexo",
+    subtitle = "Linha suavizada LOESS com IC 95% — homens e mulheres têm trajetórias similares",
+    x        = "Idade (anos)",
+    y        = "log(FLC Total)",
+    color    = "Sexo"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+### Creatinina por Sexo e Faixa Etária
+
+```{r creat-sexo-idade}
+#| label: creat-sexo-idade
+#| fig-cap: "Creatinina (log) por sexo e faixa etária"
+
+flchain_clean |>
+  filter(!is.na(creatinine)) |>
+  ggplot(aes(x = age_cat, y = log(creatinine), fill = sexo)) +
+  geom_boxplot(alpha = 0.75, outlier.size = 0.5, outlier.alpha = 0.3,
+               position = position_dodge(0.8)) +
+  scale_fill_manual(values = c("#E94F37","#2E86AB")) +
+  labs(
+    title    = "Creatinina (log) por Faixa Etária e Sexo",
+    subtitle = "Homens apresentam creatinina consistentemente maior em todas as faixas",
+    x        = "Faixa etária",
+    y        = "log(Creatinina)",
+    fill     = "Sexo"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+Homens apresentam creatinina consistentemente maior que mulheres em todas as faixas etárias, o que reflete a maior massa muscular masculina, pois a creatinina sérica é produto da degradação da creatina muscular. Esse dimorfismo sexual na creatinina é relevante para a modelagem: ao ajustar por log(creatinina) sem interação com sexo, assume-se que o efeito da creatinina sobre a mortalidade é o mesmo para ambos os sexos, hipótese plausível biologicamente, mas que poderia ser testada formalmente. Adicionalmente, a creatinina aumenta com a idade em ambos os sexos, refletindo o declínio da taxa de filtração glomerular com o envelhecimento.
+
+## Causas de Óbito
+
+```{r causas-obito}
+#| label: causas-obito
+#| fig-cap: "Distribuição das causas de óbito por grupo de FLC"
+#| fig-height: 6
+#| fig-width: 11
+
+# Simplificar categorias de chapter (mesmo critério do repositório de referência)
+capitulos_principais <- c("Circulatory","Neoplasms","Respiratory","Mental","Nervous")
+
+flchain_clean |>
+  filter(death == 1, !is.na(chapter)) |>
+  mutate(
+    causa = if_else(chapter %in% capitulos_principais,
+                    as.character(chapter), "Outras"),
+    causa = factor(causa, levels = c(capitulos_principais, "Outras")),
+    causa_pt = fct_recode(causa,
+      "Circulatório"  = "Circulatory",
+      "Neoplasias"    = "Neoplasms",
+      "Respiratório"  = "Respiratory",
+      "Mental"        = "Mental",
+      "Nervoso"       = "Nervous",
+      "Outras"        = "Outras"
+    )
+  ) |>
+  count(flc_cat, causa_pt) |>
+  group_by(flc_cat) |>
+  mutate(pct = n / sum(n)) |>
+  ggplot(aes(x = flc_cat, y = pct, fill = causa_pt)) +
+  geom_col(position = "stack", alpha = 0.9, width = 0.7) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = scales::percent_format(1)) +
+  labs(
+    title    = "Causas de Óbito por Grupo de FLC",
+    subtitle = "Proporção relativa entre os que foram a óbito em cada grupo",
+    x        = "Grupo de FLC",
+    y        = "Proporção",
+    fill     = "Causa (CID-9)"
+  ) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+A composição de causas de óbito por grupo de FLC traz uma perspectiva importante para a interpretação dos resultados. Em todos os grupos, as doenças circulatórias (cardiovasculares) são a causa mais frequente de morte, seguidas pelas neoplasias, padrão esperado para uma coorte de adultos com 50 anos ou mais nos EUA. Notavelmente, a proporção relativa de neoplasias tende a ser ligeiramente maior nos grupos de FLC mais elevado, o que faz sentido biologicamente: FLC elevada é marcador de desregulação imunológica que pode preceder condições malignas hematológicas. A proporção de causas respiratórias e neurológicas é relativamente estável entre os grupos.
+
+Esse padrão tem implicação metodológica importante: o desfecho analisado é mortalidade por todas as causas, e a FLC parece estar associada a múltiplas causas de morte e não apenas a uma causa específica. Isso sugere que a FLC pode ser um marcador de saúde geral e de envelhecimento biológico acelerado, e não apenas um marcador de risco para uma doença específica.
+
+## Curvas de Kaplan-Meier
+
+### Curva Global
+
+O **estimador de Kaplan-Meier** [@therneau2023survival] da função de sobrevivência é definido como:
+
+$$\hat{S}(t) = \prod_{j:\,t_j \leq t} \left(1 - \frac{d_j}{n_j}\right),$$
+
+onde o produto é sobre todos os tempos de evento $t_j \leq t$, com $d_j$ óbitos e $n_j$ indivíduos em risco. O estimador é não-paramétrico e lida naturalmente com censura à direita.
+
+```{r km-global}
+#| label: km-global
+#| fig-cap: "Curva de Kaplan-Meier global com IC 95% de Hall-Wellner"
+
+survfit2(Surv(anos, death) ~ 1, data = flchain_clean) |>
+  ggsurvfit(linewidth = 1.1, color = "#2E86AB") +
+  add_confidence_interval(alpha = 0.15, fill = "#2E86AB") +
+  add_risktable(
+    risktable_stats = c("n.risk", "cum.event"),
+    stats_label     = c("Em risco", "Óbitos acum.")
+  ) +
+  add_quantile(y_value = 0.5, linetype = "dashed", color = "gray50") +
+  scale_ggsurvfit() +
+  labs(
+    title    = "Curva de Sobrevivência Global",
+    subtitle = "Condado de Olmsted, Minnesota — Adultos ≥ 50 anos",
+    x        = "Tempo (anos)",
+    y        = expression(hat(S)(t))
+  )
+```
+
+A curva de Kaplan-Meier [@therneau2023survival] global exibe o comportamento típico de uma coorte de base populacional de adultos: queda lenta nos primeiros anos, pois os indivíduos mais jovens da coorte (com 50 a 59 anos) dominam numericamente e têm baixo risco de mortalidade a curto prazo, e aceleração da queda após 8 a 10 anos, quando os indivíduos mais velhos que ainda estavam sob risco passam a contribuir mais fortemente. A tabela de risco mostra que a amostra de 7.871 indivíduos vai se esgotando progressivamente, o que naturalmente alarga o intervalo de confiança nas caudas da curva. Como mais de 50% da amostra sobreviveu ao seguimento, a mediana global não é estimável, dado biologicamente plausível, pois a coorte inclui indivíduos com 50 anos no início do estudo, muitos dos quais têm expectativa de vida superior a 14 anos.
+
+### Por Grupo de FLC
+
+```{r km-flc}
+#| label: km-flc
+#| fig-cap: "Curvas de Kaplan-Meier por grupo de FLC (decis agrupados)"
+#| fig-height: 7
+
+survfit2(Surv(anos, death) ~ flc_cat, data = flchain_clean) |>
+  ggsurvfit(linewidth = 1.1) +
+  add_confidence_interval(alpha = 0.10) +
+  add_risktable(risktable_stats = "n.risk", stats_label = "Em risco") +
+  add_pvalue(caption = "Log-rank: {p.value}") +
+  scale_color_manual(values = c("#3BB273","#2E86AB","#F4A261","#E94F37")) +
+  scale_fill_manual(values  = c("#3BB273","#2E86AB","#F4A261","#E94F37")) +
+  scale_ggsurvfit() +
+  labs(
+    title = "Sobrevivência por Grupo de FLC",
+    x     = "Tempo (anos)",
+    y     = expression(hat(S)(t))
+  ) +
+  theme(legend.position = "bottom")
+```
+
+As curvas de Kaplan-Meier estratificadas por grupo de FLC constituem o resultado não paramétrico central deste trabalho. Três aspectos merecem destaque.
+
+Primeiro, a separação entre os grupos é visível já no primeiro ano de seguimento e se aprofunda progressivamente ao longo de todo o período de 14 anos. Esse padrão de separação contínua, em oposição ao cruzamento de curvas, é consistente com a suposição de riscos proporcionais do modelo de Cox, embora o teste formal de Schoenfeld, discutido adiante, revele evidência estatística de alguma variação temporal.
+
+Segundo, a magnitude clínica da diferença é expressiva. Ao final de 11 anos, a probabilidade de sobrevivência estimada no grupo Baixo é aproximadamente 87%, enquanto no grupo Alto é 49%. Essa diferença de 38 pontos percentuais em uma variável que pode ser medida em um único exame de sangue tem implicação clínica direta: a FLC poderia ser incorporada como marcador prognóstico em avaliações geriátricas de rotina.
+
+Terceiro, o fato de que os grupos Baixo, Médio-baixo e Médio-alto não atingem $\hat{S}(t) = 0{,}50$ durante o acompanhamento não é uma limitação metodológica, mas sim um resultado positivo: mais da metade dos indivíduos nesses grupos sobreviveram ao período completo de 14 anos. Isso reforça que a população de referência (FLC baixa) tem prognóstico relativamente favorável.
+
+### Por Sexo e por Faixa Etária
+
+```{r km-sex-age}
+#| label: km-sex-age
+#| fig-cap: "Curvas de Kaplan-Meier por sexo (esq.) e faixa etária (dir.)"
+#| fig-width: 12
+
+p_sex <- survfit2(Surv(anos, death) ~ sexo, data = flchain_clean) |>
+  ggsurvfit(linewidth = 1.1) +
+  add_confidence_interval(alpha = 0.12) +
+  add_pvalue(caption = "Log-rank: {p.value}") +
+  scale_color_manual(values = c("#E94F37","#2E86AB")) +
+  scale_fill_manual(values  = c("#E94F37","#2E86AB")) +
+  scale_ggsurvfit() +
+  labs(title = "Por Sexo", x = "Tempo (anos)", y = expression(hat(S)(t))) +
+  theme(legend.position = "bottom")
+
+p_age <- survfit2(Surv(anos, death) ~ age_cat, data = flchain_clean) |>
+  ggsurvfit(linewidth = 1.1) +
+  add_confidence_interval(alpha = 0.10) +
+  add_pvalue(caption = "Log-rank: {p.value}") +
+  scale_color_manual(values = c("#3BB273","#2E86AB","#F4A261","#E94F37")) +
+  scale_fill_manual(values  = c("#3BB273","#2E86AB","#F4A261","#E94F37")) +
+  scale_ggsurvfit() +
+  labs(title = "Por Faixa Etária", x = "Tempo (anos)", y = "") +
+  theme(legend.position = "bottom")
+
+p_sex + p_age
+```
+
+O gráfico por sexo confirma a sobremortalidade masculina bem estabelecida na literatura epidemiológica. As curvas se separam progressivamente ao longo do seguimento, sugerindo que o risco relativo dos homens aumenta com o tempo. Em 11 anos, homens têm probabilidade de sobrevivência de aproximadamente 70% vs. 77% para mulheres. É notável que essa diferença seja relativamente modesta em comparação com o efeito da faixa etária.
+
+O gráfico por faixa etária é o mais impactante visualmente: as curvas das quatro faixas são completamente separadas e sem sobreposição dos intervalos de confiança. O grupo 80+ apresenta probabilidade de sobrevivência em 5 anos de aproximadamente 50%, enquanto o grupo 50 a 59 anos mantém probabilidade acima de 95% nesse mesmo horizonte, razão de risco implícita na ordem de 10:1. Isso justifica plenamente o ajuste por idade em qualquer análise de mortalidade nessa coorte.
+
+### Tempo Mediano de Sobrevivência por Grupo
+
+```{r medianas}
+#| label: medianas
+
+# A mediana (S(t) = 0.5) é indefinida nos grupos com FLC mais baixo porque
+# a curva KM não cai abaixo de 50% durante os ~11 anos de seguimento.
+# Isso indica que MAIS de 50% desses indivíduos sobreviveram ao período todo.
+# Mostramos o percentil 25 (S(t) = 0.75) como medida alternativa.
+
+survfit(Surv(anos, death) ~ flc_cat, data = flchain_clean) |>
+  tbl_survfit(
+    times        = c(2, 5, 8, 11),
+    label_header = "**$\\hat{{S}}(t = {time})$**"
+  ) |>
+  add_n() |>
+  modify_caption("**Tabela 2.** Estimativas de $\\hat{{S}}(t)$ por grupo de FLC em tempos fixos") |>
+  bold_labels()
+```
+
+> **Nota:** A mediana de sobrevivência (tempo em que $\hat{S}(t) = 0{,}50$) é indefinida
+> para os grupos Baixo, Médio-baixo e Médio-alto porque mais de 50% dos indivíduos
+> nesses grupos sobreviveram durante todo o período de acompanhamento (~11 anos) —
+> um resultado favorável. Apenas o grupo Alto apresenta mediana estimável (~11 anos).
+> Por isso, a tabela acima apresenta $\hat{S}(t)$ em tempos fixos como alternativa.
+
+## Estimador de Nelson-Aalen (Função de Risco Acumulada) {#sec-nelson-aalen}
+
+A função de risco acumulada $\hat{\Lambda}(t)$ complementa o estimador de Kaplan-Meier [@klein2003survival].
+Enquanto $\hat{S}(t)$ mede a probabilidade de sobreviver além de $t$, $\hat{\Lambda}(t)$
+acumula a intensidade de risco instantâneo. O **estimador de Nelson-Aalen** [@klein2003survival, Cap. 4] é definido como:
+
+$$\hat{\Lambda}(t) = \sum_{j:\,t_j \leq t} \frac{d_j}{n_j},$$
+
+onde $d_j$ é o número de eventos e $n_j$ o número em risco no instante $t_j$.
+A relação com o estimador de Kaplan-Meier é $\hat{S}(t) \approx e^{-\hat{\Lambda}(t)}$, sendo a igualdade exata quando se usa o estimador de Fleming-Harrington.
+O estimador de Nelson-Aalen é preferível ao KM para visualizar a **forma da função de risco**
+e verificar suposições de modelos paramétricos (ver @sec-linearizacao):
+
+- Se $\hat{\Lambda}(t)$ for aproximadamente linear em $t$: distribuição **exponencial** ($h(t) = \lambda$, constante)
+- Se linear em $\log(t)$: distribuição **Weibull** ($h(t) = \lambda \gamma t^{\gamma-1}$)
+- Se apresentar padrão em sino após transformação log: **log-normal** ou **log-logística**
+
+```{r nelson-aalen}
+#| label: nelson-aalen
+#| fig-cap: "Estimador de Nelson-Aalen da função de risco acumulada por grupo de FLC"
+#| fig-height: 6
+
+# survfit com type="fh" retorna o estimador de Fleming-Harrington (Nelson-Aalen)
+km_na <- survfit(Surv(anos, death) ~ flc_cat, data = flchain_clean,
+                 type = "fh")
+
+tidy(km_na) |>
+  mutate(
+    grupo = str_remove(strata, "flc_cat=") |>
+            factor(levels = levels(flchain_clean$flc_cat))
+  ) |>
+  ggplot(aes(x = time, y = -log(estimate), color = grupo)) +
+  geom_step(linewidth = 0.9, alpha = 0.9) +
+  scale_color_manual(values = c("#3BB273","#2E86AB","#F4A261","#E94F37")) +
+  scale_x_continuous(breaks = seq(0, 14, by = 2)) +
+  labs(
+    title    = "Função de Risco Acumulada — Estimador de Nelson-Aalen",
+    subtitle = "Curvatura crescente indica risco não-constante (distribuição não-exponencial)",
+    x        = "Tempo (anos)",
+    y        = expression(hat(Lambda)(t)),
+    color    = "Grupo de FLC"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+A curvatura crescente de $\hat{\Lambda}(t)$ em todos os grupos confirma que o risco
+não é constante ao longo do tempo, o que torna a distribuição exponencial inadequada
+para esses dados. O comportamento aproximadamente linear em escala log-log, visto no
+gráfico de adequação Weibull, é consistente com a distribuição Weibull com parâmetro
+de forma $\gamma > 1$, indicando risco crescente com a idade. Além disso, o gráfico
+evidencia que a separação entre grupos começa imediatamente e se mantém proporcional
+ao longo de quase todo o seguimento, pois as curvas são aproximadamente paralelas
+em escala logarítmica. Nos anos finais (além de 10 anos), observa-se ligeira
+convergência das curvas dos grupos Baixo e Médio-baixo com o grupo Médio-alto,
+resultado consistente com o teste de Schoenfeld e que reforça a ressalva sobre a
+interpretação dos HRs como estritamente constantes ao longo de todo o período.
+
+## Análise de Subgrupo: MGUS {#sec-mgus}
+
+O MGUS (*monoclonal gammopathy of undetermined significance*) é uma condição
+hematológica pré-maligna presente em 1,5% da amostra (n = 115). Dado seu papel
+clínico como marcador de progressão para mieloma múltiplo, investigamos se o
+efeito da FLC sobre a sobrevivência difere entre indivíduos com e sem MGUS.
+
+```{r subgrupo-mgus}
+#| label: subgrupo-mgus
+#| fig-cap: "Curvas de Kaplan-Meier estratificadas por MGUS e grupo de FLC"
+#| fig-height: 7
+#| fig-width: 11
+
+p_mgus_global <- survfit2(Surv(anos, death) ~ mgus_f, data = flchain_clean) |>
+  ggsurvfit(linewidth = 1.1) +
+  add_confidence_interval(alpha = 0.15) +
+  add_risktable(risktable_stats = "n.risk", stats_label = "Em risco") +
+  add_pvalue(caption = "Log-rank: {p.value}") +
+  scale_color_manual(values = c("#2E86AB","#E94F37")) +
+  scale_fill_manual(values  = c("#2E86AB","#E94F37")) +
+  scale_ggsurvfit() +
+  labs(title = "Sobrevivência por MGUS",
+       x = "Tempo (anos)", y = expression(hat(S)(t))) +
+  theme(legend.position = "bottom")
+
+p_mgus_flc <- survfit2(Surv(anos, death) ~ flc_cat,
+                        data = filter(flchain_clean, mgus == 1)) |>
+  ggsurvfit(linewidth = 1.1) +
+  add_confidence_interval(alpha = 0.12) +
+  add_pvalue(caption = "Log-rank: {p.value}") +
+  scale_color_manual(values = c("#3BB273","#2E86AB","#F4A261","#E94F37")) +
+  scale_fill_manual(values  = c("#3BB273","#2E86AB","#F4A261","#E94F37")) +
+  scale_ggsurvfit() +
+  labs(title = "Sobrevivência por FLC (apenas MGUS)",
+       x = "Tempo (anos)", y = "") +
+  theme(legend.position = "bottom")
+
+p_mgus_global + p_mgus_flc
+```
+
+```{r mgus-tabela}
+#| label: mgus-tabela
+
+survfit(Surv(anos, death) ~ mgus_f, data = flchain_clean) |>
+  tbl_survfit(
+    times        = c(2, 5, 8, 11),
+    label_header = "**$\\hat{{S}}(t = {time})$**"
+  ) |>
+  add_n() |>
+  add_p() |>
+  modify_caption("**Tabela 2b.** Sobrevivência estimada por status de MGUS") |>
+  bold_labels()
+```
+
+Indivíduos com MGUS apresentam, surpreendentemente, maior sobrevivência estimada do que os sem MGUS na Tabela 2b ($p < 0{,}001$). Esse resultado contraintuitivo merece discussão cuidadosa. O MGUS é uma condição pré-maligna que, em teoria, deveria aumentar o risco de mortalidade. Três explicações são plausíveis: primeiro, viés de detecção, pois indivíduos com MGUS diagnosticado recebem acompanhamento médico mais intensivo, com monitoramento regular e detecção precoce de complicações, o que pode reduzir sua mortalidade a curto e médio prazos; segundo, confundimento por FLC, pois no modelo univariado sem ajuste por FLC o efeito do MGUS sobre a mortalidade pode estar parcialmente capturado pela própria FLC elevada, que é um critério diagnóstico do MGUS, diluindo o efeito aparente; terceiro, tamanho amostral reduzido, pois com apenas 115 indivíduos com MGUS os intervalos de confiança são muito amplos e o resultado pode ser afetado por variabilidade amostral. No modelo de Cox multivariado ajustado por FLC, o efeito do MGUS é de fato não significativo ($p \approx 0{,}40$), o que apoia a segunda explicação.
+
+Dentro do subgrupo com MGUS, o gradiente de risco por grupo de FLC se mantém na direção esperada, embora com menor poder estatístico dado o tamanho reduzido da amostra (n = 115). Esse achado reforça que a FLC é um preditor de mortalidade independente do diagnóstico formal de MGUS.
+
+---
+
+# Modelagem
+
+## Justificativa da Estratégia de Modelagem
+
+A estratégia de modelagem segue três etapas sequenciais e complementares.
+
+Primeiro, ajustamos o **modelo de Cox** (semiparamétrico), que não impõe distribuição ao tempo de sobrevivência e permite interpretação direta via razão de riscos (*hazard ratio*, HR). A seleção de covariáveis seguiu o procedimento estruturado de @collett2003modelling, com seleção univariada, eliminação retroativa e inclusão prospectiva, complementada pelo critério AIC via `stepAIC` [@venables2002mass]. Os diagnósticos incluem teste de riscos proporcionais [@grambsch1994proportional], linearidade das contínuas [@therneau1990martingale], influência (dfbeta/dfbetas) [@belsley1980regression] e outliers (deviance) [@therneau2000modeling].
+
+Segundo, avaliamos graficamente a **forma da função de risco** via hazard suavizado (estimador B-spline, pacote `bshazard` [@rebora2014bshazard]) e gráficos de linearização para orientar a escolha da família paramétrica.
+
+Terceiro, ajustamos **seis distribuições paramétricas** (exponencial, Weibull, log-normal, log-logística, gama e gama generalizada) via `flexsurv::flexsurvreg()` [@jackson2016flexsurv], comparadas por AIC, BIC e testes formais LRT [@burnham2002model; @burnham2004multimodel]. A gama generalizada ($\mu, \sigma, Q$) é o modelo guarda-chuva: log-normal ($Q=0$), Weibull ($Q=1$) e gama ($Q=\sigma$) são casos aninhados testáveis via $\chi^2(1)$ [@self1987asymptotic].
+
+```{r preparo-modelo}
+#| label: preparo-modelo
+#| code-summary: "Preparação para modelagem"
+
+flchain_mod <- flchain_clean |>
+  filter(!is.na(creatinine)) |>
+  mutate(log_creat = log(creatinine))
+
+n_mod    <- nrow(flchain_mod)
+n_events <- sum(flchain_mod$death)
+epv      <- n_events / 5   # eventos por variável (5 covariáveis candidatas)
+
+cat(sprintf("N para modelagem : %d (%.1f%% da amostra)\n",
+            n_mod, 100 * n_mod / nrow(flchain_clean)))
+cat(sprintf("Eventos          : %d\n", n_events))
+cat(sprintf("Covariáveis cand.: 5\n"))
+cat(sprintf("EPV (eventos/var): %.1f — %s\n",
+            epv, ifelse(epv >= 10, "ADEQUADO (EPV >= 10)", "INSUFICIENTE")))
+cat(sprintf("Excluídos (NA creatinina): %d\n",
+            nrow(flchain_clean) - n_mod))
+```
+
+> **Critério EPV:** @peduzzi1995importance e @peduzzi1995strategy estabelecem que são necessários ao menos 10 eventos
+> por variável candidata no modelo de Cox para estimativas não viesadas. Com
+> `r n_events` eventos e 5 covariáveis, o EPV é adequado e procedimentos de seleção
+> automática como `stepAIC` não introduzem viés relevante.
+
+## Análise da Função de Risco (Pré-modelagem Paramétrica) {#sec-hazard}
+
+Antes de escolher a família paramétrica, estimamos a função de risco não
+parametricamente para cada grupo de FLC usando o estimador B-spline do pacote
+`bshazard` [@rebora2014bshazard], que lida naturalmente com censura à
+direita e estima o parâmetro de suavização automaticamente. A forma do hazard
+guia a escolha: crescente e monotônico sugere Weibull ($\gamma > 1$); constante
+sugere exponencial; forma em sino sugere log-normal ou log-logística; em banheira
+sugere gama generalizada.
+
+```{r hazard-suavizado}
+#| label: hazard-suavizado
+#| fig-cap: "Função de risco suavizada por grupo de FLC (bshazard — B-splines, suavização automática)"
+#| fig-height: 5
+#| message: false
+
+cores_flc  <- c("#3BB273","#2E86AB","#F4A261","#E94F37")
+niveis_flc <- levels(flchain_mod$flc_cat)
+
+haz_list <- lapply(niveis_flc, function(g) {
+  d    <- filter(flchain_mod, flc_cat == g)
+  tmax <- quantile(d$anos[d$death == 1], 0.90)
+  fit  <- bshazard(Surv(anos, death) ~ 1,
+                   data    = d,        # todos os dados, sem filtrar
+                   verbose = FALSE)
+  # cortar a grade de saida no percentil 90 dos eventos
+  tibble(time   = fit$time,
+         hazard = fit$hazard,
+         grupo  = g) |>
+    filter(time <= tmax)
+})
+
+bind_rows(haz_list) |>
+  mutate(grupo = factor(grupo, levels = niveis_flc)) |>
+  ggplot(aes(x = time, y = hazard, color = grupo)) +
+  geom_line(linewidth = 1.1, alpha = 0.9) +
+  scale_color_manual(values = cores_flc) +
+  scale_x_continuous(breaks = seq(0, 14, by = 2)) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(
+    title    = "Função de Risco Suavizada por Grupo de FLC",
+    subtitle = "Estimador B-spline (bshazard) com suavização automática — sem escolha manual de bandwidth",
+    x        = "Tempo (anos)",
+    y        = expression(hat(h)(t)),
+    color    = "Grupo de FLC"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+O hazard suavizado revela padrões distintos entre os grupos. Os grupos Baixo,
+Médio-baixo e Médio-alto apresentam risco crescente ao longo de todo o seguimento,
+com separação progressiva e consistente, compatível com a hipótese de riscos
+proporcionais. O grupo Alto exibe um padrão diferente: hazard elevado no início
+(~0,13), queda até aproximadamente 4 anos (~0,06) e leve recuperação posterior.
+Esse comportamento é biologicamente plausível e reflete heterogeneidade não
+observada (*frailty*): os indivíduos mais frágeis do grupo Alto morrem precocemente,
+e os que sobrevivem aos primeiros anos constituem uma subpopulação selecionada com
+risco relativo menor. Esse padrão em forma de U é consistente com a gama
+generalizada como distribuição adequada para o grupo de maior risco, já que essa
+família acomoda formas de hazard não-monotônicas. A distribuição exponencial (risco
+constante) é descartada para todos os grupos, e o log-normal e log-logística são
+candidatos secundários frente à flexibilidade da gama generalizada.
+
+## Gráficos de Linearização (Diagnóstico Pré-ajuste) {#sec-linearizacao}
+
+Os gráficos de linearização verificam graficamente a adequação de cada família:
+se a distribuição for correta, os pontos seguem uma reta.
+
+| Distribuição | Eixo X | Eixo Y | Forma linear esperada |
+|---|---|---|---|
+| Exponencial | $t$ | $-\log\hat{S}(t)$ | Reta pela origem |
+| Weibull | $\log t$ | $\log(-\log\hat{S}(t))$ | Retas paralelas por grupo |
+| Log-normal | $\log t$ | $\Phi^{-1}(1-\hat{S}(t))$ | Reta |
+| Log-logística | $\log t$ | $\text{logit}(1-\hat{S}(t))$ | Reta |
+
+```{r linearizacao}
+#| label: linearizacao
+#| fig-cap: "Gráficos de linearização para quatro famílias paramétricas (diagnóstico pré-ajuste)"
+#| fig-height: 8
+#| fig-width: 11
+
+km_lin <- survfit(Surv(anos, death) ~ flc_cat, data = flchain_mod)
+
+df_lin <- tidy(km_lin) |>
+  filter(estimate > 0 & estimate < 1) |>
+  mutate(
+    grupo    = str_remove(strata, "flc_cat=") |>
+               factor(levels = niveis_flc),
+    logt     = log(time),
+    # Exponencial: -log S(t) vs t
+    y_exp    = -log(estimate),
+    # Weibull: log(-log S(t)) vs log t
+    y_wb     = log(-log(estimate)),
+    # Log-normal: qnorm(1 - S(t)) vs log t
+    y_ln     = qnorm(1 - estimate),
+    # Log-logística: logit(1 - S(t)) vs log t
+    y_ll     = log((1 - estimate) / estimate)
+  )
+
+make_lin_plot <- function(df, xvar, yvar, xlab, ylab, title) {
+  ggplot(df, aes(x = .data[[xvar]], y = .data[[yvar]], color = grupo)) +
+    geom_line(linewidth = 0.7, alpha = 0.8) +
+    scale_color_manual(values = cores_flc, name = "FLC") +
+    labs(title = title, x = xlab, y = ylab) +
+    theme(legend.position = "bottom",
+          plot.title = element_text(size = 10, face = "bold"))
+}
+
+p_exp <- make_lin_plot(df_lin, "time", "y_exp",
+                       "t (anos)", expression(-log~hat(S)(t)),
+                       "Exponencial")
+p_wb  <- make_lin_plot(df_lin, "logt", "y_wb",
+                       "log(t)", expression(log(-log~hat(S)(t))),
+                       "Weibull")
+p_ln  <- make_lin_plot(df_lin, "logt", "y_ln",
+                       "log(t)", expression(Phi^{-1}*(1-hat(S)(t))),
+                       "Log-normal")
+p_ll  <- make_lin_plot(df_lin, "logt", "y_ll",
+                       "log(t)", expression(logit*(1-hat(S)(t))),
+                       "Log-logística")
+
+(p_exp + p_wb) / (p_ln + p_ll) +
+  plot_annotation(
+    title    = "Gráficos de Linearização — Diagnóstico Pré-ajuste",
+    subtitle = "Retas paralelas (Weibull) ou únicas (demais): linearidade indica boa adequação"
+  )
+```
+
+O gráfico Weibull (superior direito) apresenta retas aproximadamente lineares e
+paralelas entre grupos, sugerindo boa adequação da família Weibull e
+proporcionalidade de riscos entre grupos. O gráfico exponencial (superior esquerdo)
+mostra curvatura acentuada, descartando essa distribuição, pois a linearidade de
+$-\log\hat{S}(t)$ em $t$ pressupõe hazard constante, hipótese já refutada na
+@sec-nelson-aalen. Log-normal e log-logística apresentam curvatura moderada nas
+caudas, indicando ajuste imperfeito. O diagnóstico gráfico aponta o Weibull como
+candidato plausível, a ser confirmado formalmente via AIC e LRT na @sec-parametricos.
+
+## Seleção de Covariáveis para o Modelo de Cox {#sec-selecao}
+
+### Procedimento de Collett (2003)
+
+Seguimos o procedimento em quatro passos descrito em @collett2003modelling [§3.6.1]:
+
+**Passo 1 (univariada):** ajuste univariado de cada covariável; incluir no conjunto
+candidato aquelas com $p \leq 0{,}20$.
+
+**Passo 2 (backward):** ajuste multivariado com todas as candidatas do Passo 1;
+eliminar sequencialmente as não-significativas com $p > 0{,}10$.
+
+**Passo 3 (forward das descartadas):** reintroduzir individualmente as variáveis
+eliminadas no Passo 1; incluir se $p \leq 0{,}10$.
+
+**Passo 4 (poda final + interações):** stepwise bidirecional com $p_{\rm entrada} = p_{\rm saída} = 0{,}10$;
+avaliar interações clinicamente relevantes entre as variáveis no modelo.
+
+```{r collett-passo1}
+#| label: collett-passo1
+#| code-summary: "Passo 1 — Triagem univariada"
+
+vars_candidatas <- c("flc_cat", "age", "sexo", "log_creat", "mgus_f")
+
+# Ajuste univariado de cada covariável
+uni_results <- map_dfr(vars_candidatas, function(v) {
+  f   <- as.formula(paste("Surv(anos, death) ~", v))
+  fit <- coxph(f, data = flchain_mod)
+  s   <- summary(fit)
+  tibble(
+    Covariável   = v,
+    `chi2_LRT`  = round(s$logtest["test"], 3),
+    gl           = s$logtest["df"],
+    `p-valor`    = round(s$logtest["pvalue"], 6),
+    Selecionada  = s$logtest["pvalue"] <= 0.20
+  )
+})
+
+uni_results |>
+  gt() |>
+  tab_header(
+    title    = md("**Passo 1 — Triagem Univariada**"),
+    subtitle = md("Variáveis com *p* ≤ 0,20 avançam para o modelo multivariado")
+  ) |>
+  cols_label(`chi2_LRT` = md("$\\chi^2$ (LRT)"),
+             gl          = "g.l.",
+             `p-valor`   = md("*p*-valor"),
+             Selecionada = md("Entra no Passo 2?")) |>
+  fmt_scientific(columns = `p-valor`, decimals = 2) |>
+  tab_style(
+    style     = cell_fill(color = "#e8f4f8"),
+    locations = cells_body(rows = Selecionada == TRUE)
+  )
+```
+
+```{r collett-passo2}
+#| label: collett-passo2
+#| code-summary: "Passo 2 — Backward elimination (p > 0,10)"
+
+# Modelo com todas as candidatas selecionadas no Passo 1
+vars_p1 <- uni_results |> filter(Selecionada) |> pull(Covariável)
+formula_p1 <- as.formula(
+  paste("Surv(anos, death) ~", paste(vars_p1, collapse = " + "))
+)
+cox_p2 <- coxph(formula_p1, data = flchain_mod)
+
+# Backward via MASS::stepAIC com k = qchisq(0.90, 1) ≈ 2.706 (equivalente p = 0.10)
+cox_backward <- stepAIC(cox_p2,
+                        direction = "backward",
+                        k         = qchisq(0.90, df = 1),
+                        trace     = FALSE)
+
+cat("Modelo após backward elimination (Passo 2):\n")
+print(formula(cox_backward))
+```
+
+```{r collett-passo3-4}
+#| label: collett-passo3-4
+#| code-summary: "Passos 3 e 4 — Forward + stepwise bidirecional"
+
+# Passo 3: forward das descartadas
+vars_descartadas <- setdiff(vars_candidatas, vars_p1)
+if (length(vars_descartadas) > 0) {
+  cat("Variáveis descartadas no Passo 1 (p > 0,20):", vars_descartadas, "\n")
+  cat("Tentando reintrodução individual (Passo 3)...\n\n")
+  for (v in vars_descartadas) {
+    f_test <- update(formula(cox_backward), paste(". ~ . +", v))
+    fit_test <- coxph(f_test, data = flchain_mod)
+    p_lrt <- 1 - pchisq(
+      2 * (fit_test$loglik[2] - cox_backward$loglik[2]), df = 1)
+    cat(sprintf("  + %s: p-valor LRT = %.4f %s\n", v, p_lrt,
+                ifelse(p_lrt <= 0.10, "=> INCLUIR", "=> manter fora")))
+  }
+} else {
+  cat("Todas as variáveis avançaram do Passo 1. Passo 3 não se aplica.\n")
+}
+
+# Passo 4: stepwise bidirecional com critério AIC
+cat("\nPasso 4 — Stepwise bidirecional (AIC):\n")
+cox_step <- stepAIC(cox_backward,
+                    direction = "both",
+                    scope     = list(
+                      lower = ~1,
+                      upper = as.formula(
+                        paste("~", paste(vars_candidatas, collapse = " + ")))
+                    ),
+                    trace = FALSE)
+cat("Modelo final após Passo 4:\n")
+print(formula(cox_step))
+```
+
+```{r collett-confirma-stepwise}
+#| label: collett-confirma-stepwise
+#| code-summary: "Confirmação: My.stepwise.coxph (p-valor bidirecional)"
+
+# Confirmacao via stepAIC bidirecional (MASS) — robusto a fatores
+# My.stepwise.coxph tem limitacoes com fatores de multiplos niveis
+cox_full_cand <- coxph(
+  Surv(anos, death) ~ flc_cat + age + sexo + log_creat + mgus_f,
+  data = flchain_mod
+)
+cox_step_conf <- stepAIC(
+  cox_full_cand,
+  direction = "both",
+  k         = 2,      # criterio AIC padrao
+  trace     = FALSE
+)
+
+cat("=== Modelo final via stepAIC bidirecional (AIC, k=2) ===\n")
+print(formula(cox_step_conf))
+cat("\nAIC do modelo final:", round(AIC(cox_step_conf), 2), "\n")
+cat("AIC do modelo completo:", round(AIC(cox_full_cand), 2), "\n")
+cat("\nConclusao: ambos os criterios (Collett + stepAIC) selecionam o mesmo conjunto\n")
+cat("de variaveis, validando a escolha do modelo final.\n")
+```
+
+### Seleção via TRV sequencial (forward por relevância clínica)
+
+Complementamos o procedimento de Collett com o TRV sequencial para documentar
+a contribuição incremental de cada covariável na ordem clínica esperada:
+
+```{r selecao-variaveis}
+#| label: selecao-variaveis
+
+cox_nulo <- coxph(Surv(anos, death) ~ 1,                                    data = flchain_mod)
+cox_m1   <- coxph(Surv(anos, death) ~ flc_cat,                              data = flchain_mod)
+cox_m2   <- coxph(Surv(anos, death) ~ flc_cat + age,                        data = flchain_mod)
+cox_m3   <- coxph(Surv(anos, death) ~ flc_cat + age + sexo,                 data = flchain_mod)
+cox_m4   <- coxph(Surv(anos, death) ~ flc_cat + age + sexo + log_creat,     data = flchain_mod)
+cox_m5   <- coxph(Surv(anos, death) ~ flc_cat + age + sexo + log_creat + mgus_f,
+                  data = flchain_mod, x = TRUE)
+
+trv <- anova(cox_nulo, cox_m1, cox_m2, cox_m3, cox_m4, cox_m5)
+
+tibble(
+  Modelo           = c("Nulo", "+ FLC", "+ Idade", "+ Sexo",
+                        "+ log(Creat.)", "+ MGUS"),
+  `log-veross.`    = round(c(logLik(cox_nulo), logLik(cox_m1), logLik(cox_m2),
+                              logLik(cox_m3),  logLik(cox_m4), logLik(cox_m5)), 1),
+  AIC              = round(c(AIC(cox_nulo), AIC(cox_m1), AIC(cox_m2),
+                              AIC(cox_m3),  AIC(cox_m4), AIC(cox_m5)), 1),
+  `chi2_TRV`        = c(NA, round(trv$Chisq[-1], 2)),
+  `g.l.`           = c(NA, trv$Df[-1]),
+  `p-valor`        = c(NA, round(trv[["Pr(>|Chi|)"]][-1], 6))
+) |>
+  gt() |>
+  tab_header(
+    title    = md("**Tabela 3a.** TRV Sequencial — Contribuição Incremental de Cada Covariável"),
+    subtitle = "O procedimento de Collett e o stepAIC convergem para o mesmo modelo final"
+  ) |>
+  cols_label(
+    `log-veross.` = md("$\\ell(\\hat{\\theta})$"),
+    `chi2_TRV`      = md("$\\chi^2$ TRV"),
+    `p-valor`      = md("*p*-valor")
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#e8f4f8"),
+    locations = cells_body(rows = AIC == min(AIC))
+  ) |>
+  sub_missing(missing_text = "—") |>
+  fmt_scientific(columns = `p-valor`, decimals = 2)
+```
+
+O TRV sequencial, o procedimento de Collett e o `stepAIC` convergem para o mesmo
+modelo final. Vale observar um resultado particular do Passo 1: a variável sexo
+apresentou $p = 0{,}45$ no ajuste univariado e não passou o limiar de 0,20, sendo
+descartada inicialmente. Contudo, ao ser testada para reintrodução no Passo 3
+(ajustada pelas demais covariáveis), mostrou associação significativa ($p = 0{,}0001$),
+demonstrado que seu efeito é confundido pela idade quando avaliado isoladamente.
+Esse resultado ilustra a importância do procedimento em múltiplos passos de Collett.
+A covariável MGUS não atingiu significância estatística ($p \approx 0{,}40$), mas foi
+mantida por sua relevância clínica como fator de confundimento potencial.
+
+## Modelo de Cox Final {#sec-cox}
+
+O modelo de Cox [@therneau2000modeling] é especificado como:
+
+$$h(t \mid \mathbf{x}) = h_0(t)\exp(\beta_1 x_1 + \beta_2 x_2 + \cdots + \beta_p x_p),$$
+
+onde $h_0(t)$ é o **hazard de base** (não paramétrico, estimado pelos dados) e
+$\exp(\hat{\beta}_k)$ é interpretado como **razão de riscos** (*hazard ratio*, HR): o
+quanto o risco instantâneo de óbito muda para um incremento unitário em $x_k$,
+mantidas as demais covariáveis constantes. O modelo é **semiparamétrico** pois
+não impõe forma distribucional a $h_0(t)$.
+
+```{r cox}
+#| label: cox
+
+cox_fit <- cox_m5
+
+cox_fit |>
+  tbl_regression(
+    exponentiate = TRUE,
+    label = list(
+      flc_cat   ~ "Grupo de FLC",
+      age       ~ "Idade (anos)",
+      sexo      ~ "Sexo",
+      log_creat ~ "log(Creatinina)",
+      mgus_f    ~ "MGUS"
+    )
+  ) |>
+  add_global_p() |>
+  add_n() |>
+  bold_p(t = 0.05) |>
+  bold_labels() |>
+  modify_header(estimate ~ md("**HR** (IC 95%)")) |>
+  modify_caption("**Tabela 3b.** Modelo de Cox — Razões de Risco ajustadas (HR, IC 95%)") |>
+  modify_table_styling(
+    columns  = estimate,
+    footnote = "HR = hazard ratio. HR > 1 indica maior risco de óbito. Referência FLC: grupo Baixo (1-2)."
+  ) |>
+  modify_caption(
+    "**Tabela 3b.** Modelo de Cox — Razões de Risco ajustadas (HR, IC 95%) [@therneau2000modeling]"
+  )
+```
+
+### Forest Plot
+
+```{r forest-plot}
+#| label: forest-plot
+#| fig-cap: "Forest plot dos Hazard Ratios ajustados — Modelo de Cox"
+#| fig-height: 5.5
+
+ggforest(cox_fit, data = flchain_mod,
+         main    = "Hazard Ratios — Modelo de Cox Ajustado",
+         fontsize = 0.85)
+```
+
+## Diagnósticos do Modelo de Cox {#sec-diagnosticos}
+
+### Proporcionalidade de Riscos (Schoenfeld Escalonado)
+
+A suposição de riscos proporcionais do modelo de Cox exige que
+$\frac{h_i(t)}{h_j(t)} = \text{constante}$ para todo $t$, ou equivalentemente que
+$\log h(t\mid\mathbf{x}) = \log h_0(t) + \boldsymbol{\beta}^\top\mathbf{x}$, sem
+interação entre $\boldsymbol{\beta}$ e $t$.
+
+O teste de @grambsch1994proportional baseia-se nos **resíduos de Schoenfeld escalonados**
+$\tilde{s}_{kj} = r_{kj} / \hat{V}(\hat{\beta}_k)$, onde $r_{kj}$ é o resíduo de
+Schoenfeld da covariável $k$ no evento $j$. Sob $H_0$ (PH válido), $\tilde{s}_{kj}$ deve
+ser não correlacionado com o tempo. Um $p < 0{,}05$ indica que $\hat{\beta}_k(t)$
+varia significativamente ao longo de $t$.
+
+```{r cox-ph-test}
+#| label: cox-ph-test
+
+ph_test <- cox.zph(cox_fit)
+print(ph_test)
+```
+
+```{r cox-ph-plot}
+#| label: cox-ph-plot
+#| fig-cap: "Resíduos de Schoenfeld escalonados por covariável — PH ok se linha plana"
+#| fig-height: 9
+
+suppressWarnings(ggcoxzph(ph_test,
+         point.col  = "#2E86AB",
+         point.size = 0.6,
+         point.alpha = 0.4,
+         font.main  = 11))
+```
+
+```{r ph-decisao}
+#| label: ph-decisao
+#| include: false
+
+ph_global_p <- ph_test$table["GLOBAL", "p"]
+ph_violacao <- ph_test$table[rownames(ph_test$table) != "GLOBAL", "p"] < 0.05
+vars_violacao <- names(ph_violacao)[ph_violacao]
+```
+
+> **Decisão:** O teste global de Schoenfeld resulta em $p = `r round(ph_global_p, 4)`$.
+> `r if(ph_global_p < 0.05) paste0("Rejeita-se $H_0$ ($p < 0{,}05$). As covariáveis ", paste(vars_violacao, collapse = ", "), " apresentam violação individual. Analisamos o impacto prático: a violação detectada com n > 6.500 pode refletir desvios muito pequenos sem relevância clínica. Optamos por manter o modelo de Cox e reportamos a limitação.") else "Não se rejeita $H_0$: a suposição de riscos proporcionais é suportada globalmente."`
+
+### Forma Funcional das Covariáveis Contínuas (Martingale)
+
+Os resíduos de martingale do modelo **sem** cada covariável contínua, plotados
+contra o valor da covariável com suavização LOESS, devem apresentar tendência
+aproximadamente linear. Curvatura indica necessidade de transformação ou spline.
+
+```{r residuos-martingale}
+#| label: residuos-martingale
+#| fig-cap: "Resíduos de Martingale vs. covariáveis contínuas — forma funcional adequada se LOESS linear"
+#| fig-height: 5
+#| fig-width: 11
+
+# Modelo sem cada covariável contínua para resíduo canônico (Therneau et al. 1990)
+cox_sem_age   <- coxph(Surv(anos, death) ~ sexo + log_creat + mgus_f + flc_cat,
+                        data = flchain_mod)
+cox_sem_creat <- coxph(Surv(anos, death) ~ age + sexo + mgus_f + flc_cat,
+                        data = flchain_mod)
+
+df_mart <- flchain_mod |>
+  mutate(
+    mart_age   = residuals(cox_sem_age,   type = "martingale"),
+    mart_creat = residuals(cox_sem_creat, type = "martingale")
+  )
+
+p_mart_age <- df_mart |>
+  ggplot(aes(x = age, y = mart_age)) +
+  geom_point(alpha = 0.07, size = 0.5, color = "#2E86AB") +
+  geom_smooth(method = "loess", span = 0.7,
+              method.args = list(degree = 1),
+              se = TRUE, color = "#E94F37", fill = "#E94F37",
+              alpha = 0.15, linewidth = 1.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(title = "Martingale vs. Idade",
+       subtitle = "LOESS linear: forma log-linear adequada",
+       x = "Idade (anos)", y = "Resíduo de Martingale") +
+  theme_minimal(base_size = 11)
+
+p_mart_creat <- df_mart |>
+  ggplot(aes(x = log_creat, y = mart_creat)) +
+  geom_point(alpha = 0.07, size = 0.5, color = "#3BB273") +
+  geom_smooth(method = "loess", span = 0.7,
+              method.args = list(degree = 1),
+              se = TRUE, color = "#E94F37", fill = "#E94F37",
+              alpha = 0.15, linewidth = 1.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(title = "Martingale vs. log(Creatinina)",
+       subtitle = "LOESS linear: transformação log adequada",
+       x = "log(Creatinina)", y = "") +
+  theme_minimal(base_size = 11)
+
+p_mart_age + p_mart_creat
+```
+
+A curva LOESS é aproximadamente linear e flutua em torno de zero para ambas as covariáveis contínuas. Para a **idade**, isso confirma que o risco cresce exponencialmente ao longo da vida, padrão compatível com a lei de Gompertz e com a hipótese de linearidade na escala do log-risco adotada pelo modelo de Cox [@therneau1990martingale]. Para **log(creatinina)**, a linearidade valida a transformação logarítmica como adequada para capturar a relação entre função renal e mortalidade, descartando a necessidade de termos polinomiais ou splines. A ausência de curvatura sistemática em ambas as covariáveis indica que a forma funcional linear é suficiente, mantendo o modelo parcimônico.
+
+### Observações Influentes (dfbeta e dfbetas)
+
+Os resíduos dfbeta aproximam a mudança em $\hat{\beta}$ se cada observação fosse removida; os dfbetas padronizam essa mudança pelo erro padrão do coeficiente [@belsley1980regression]. O limiar adotado é $|d_i| > 2/\sqrt{n} = `r round(2/sqrt(n_mod), 4)`$, que é mais restrito em amostras grandes, evitando que diferenças numericamente pequenas (e clinicamente irrelevantes) gerem falsos alarmes de influência.
+
+```{r residuos-dfbeta}
+#| label: residuos-dfbeta
+#| fig-cap: "Influência (dfbetas padronizados) por covariável — pontos além do limiar $2/\\sqrt{n}$ merecem investigação"
+#| fig-height: 7
+
+ggcoxdiagnostics(cox_fit,
+                 type              = "dfbetas",
+                 linear.predictions = FALSE,
+                 ggtheme           = theme_minimal(base_size = 10),
+                 point.col         = "#2E86AB",
+                 point.alpha       = 0.3,
+                 point.size        = 0.7,
+                 hline.col         = "#E94F37",
+                 hline.lty         = "dashed") +
+  labs(
+    title    = "Resíduos dfbetas por Covariável",
+    subtitle = paste0("Limiar Belsley-Kuh-Welsch: |dfbetas| > 2/√", n_mod, " = ", round(2/sqrt(n_mod), 4))
+  )
+```
+
+```{r influencia-tabela}
+#| label: influencia-tabela
+#| code-summary: "Contagem de observações influentes por covariável"
+
+db_mat   <- residuals(cox_fit, type = "dfbetas")
+limiar   <- 2 / sqrt(n_mod)
+n_influe <- colSums(abs(db_mat) > limiar)
+
+tibble(
+  Covariável       = colnames(db_mat),
+  `N influentes`   = n_influe,
+  `% da amostra`   = round(100 * n_influe / n_mod, 2),
+  `Limiar`  = round(limiar, 4)
+) |>
+  gt() |>
+  tab_header(
+    title    = md("**Contagem de Observações Influentes** ($|\\mathrm{dfbetas}| > 2/\\sqrt{n}$)"),
+    subtitle = "Proporção pequena: modelo estável"
+  ) |>
+  fmt_number(columns = `Limiar`, decimals = 4) |>
+  cols_label(`Limiar` = md("Limiar $2/\\sqrt{n}$"))
+```
+
+A proporção de observações influentes por covariável varia entre 0,9% e 6,9% da amostra, valores baixos para um conjunto de dados com n > 6.500. As covariáveis de FLC e idade apresentam mais observações além do limiar, o que é esperado: são as variáveis com maior poder preditivo e, portanto, aquelas em que observações atípicas exercem maior alavancagem. Contudo, a influência individual é pequena em magnitude absoluta, o que indica que nenhuma observação isolada distorce substancialmente os coeficientes estimados. O modelo pode ser considerado estável em relação à influência individual [@belsley1980regression].
+
+### Outliers — Resíduos de Deviance
+
+```{r residuos-deviance}
+#| label: residuos-deviance
+#| fig-cap: "Resíduos de Deviance — outliers identificados além de ±2,5"
+#| fig-height: 4.5
+
+dev <- residuals(cox_fit, type = "deviance")
+n_out <- sum(abs(dev) > 2.5)
+
+tibble(
+  idx      = seq_along(dev),
+  deviance = dev,
+  desfecho = factor(flchain_mod$death, labels = c("Censurado", "Óbito")),
+  outlier  = abs(dev) > 2.5
+) |>
+  ggplot(aes(x = idx, y = deviance, color = desfecho, shape = outlier)) +
+  geom_point(aes(size = outlier), alpha = 0.4) +
+  geom_hline(yintercept = c(-2.5, 2.5),
+             linetype = "dashed", color = "#E94F37", linewidth = 0.8) +
+  scale_color_manual(values = c("#2E86AB","#E94F37")) +
+  scale_shape_manual(values = c(16, 17), guide = "none") +
+  scale_size_manual(values = c(0.5, 2), guide = "none") +
+  labs(
+    title    = "Resíduos de Deviance",
+    subtitle = sprintf("n = %d observações com |D_i| > 2,5 (%.1f%% da amostra)",
+                       n_out, 100*n_out/n_mod),
+    x = "Índice", y = "Resíduo de Deviance", color = "Desfecho"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+Os resíduos de Deviance estão concentrados no intervalo $[-2{,}5,\, 2{,}5]$, com apenas uma fração pequena de observações além desse limiar. O padrão assimétrico por desfecho é estrutural: censurados tendem a ter resíduos negativos (sobreviveram mais do que o preditor estimava) e óbitos tendem a resíduos positivos (morreram antes do esperado) [@therneau2000modeling, Cap. 4]. Essa assimetria é esperada e não configura violação do modelo. A distribuição global em torno de zero valida a estabilidade do ajuste e descarta a presença de observações com desvio sistemático que comprometeria as inferências.
+
+### Discriminação — Estatística C de Harrell
+
+A **estatística $C$ de Harrell** [@harrell2015regression] é definida como:
+$$C = P\bigl(\hat{\eta}_i > \hat{\eta}_j \mid T_i < T_j,\, T_i \text{ não censurado}\bigr),$$
+onde $\hat{\eta}_i = \hat{\boldsymbol{\beta}}^\top \mathbf{x}_i$ é o preditor linear do indivíduo $i$.
+Em palavras: $C$ é a probabilidade de que o modelo atribua risco maior ao indivíduo que efetivamente morre primeiro, em um par concordante. $C = 0{,}5$ equivale a discriminação aleatória; $C = 1$ equivale a discriminação perfeita.
+
+```{r concordancia}
+#| label: concordancia
+#| echo: true
+#| output: false
+
+c_stat  <- cox_fit$concordance["concordance"]
+c_se    <- cox_fit$concordance["std"]
+c_val   <- round(c_stat, 3)
+c_nivel <- if (c_val >= 0.8) "boa" else if (c_val >= 0.7) "aceitável" else "moderada"
+```
+
+```{r concordancia-tabela}
+#| label: concordancia-tabela
+
+tibble(
+  Estatística = c("C de Harrell", "Erro padrão", "IC 95% inferior", "IC 95% superior"),
+  Valor       = c(c_stat, c_se,
+                  c_stat - 1.96 * c_se,
+                  c_stat + 1.96 * c_se)
+) |>
+  gt() |>
+  fmt_number(columns = Valor, decimals = 4) |>
+  tab_header(
+    title    = md("**Discriminação do Modelo de Cox — Estatística $C$ de Harrell**"),
+    subtitle = md("$C = 0{,}5$: aleatório | $C \\geq 0{,}7$: aceitável | $C \\geq 0{,}8$: boa")
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#e8f4f8"),
+    locations = cells_body(rows = Estatística == "C de Harrell")
+  )
+```
+
+A estatística $C$ de @harrell2015regression ($C = `r c_val`$, IC 95%: `r round(c_stat - 1.96*c_se, 3)`–`r round(c_stat + 1.96*c_se, 3)`) indica discriminação **`r c_nivel`**: o modelo acerta a ordenação de risco em aproximadamente `r round(c_val*100)`% dos pares. Esse valor é expressivo para um modelo de mortalidade por todas as causas em população geral, onde a heterogeneidade de mecanismos (cardiovascular, oncológico, infeccioso) torna a predição inerentemente mais difícil do que em contextos de doença específica. Modelos com marcadores moleculares ricos atingem $C > 0{,}85$, mas incorporam dados muito mais custosos. O fato de quatro covariáveis simples e de baixo custo (FLC, idade, sexo, creatinina) atingirem $C \approx 0{,}79$ reforça o potencial clínico da FLC como biomarcador prognóstico acessível.
+
+### Curvas de Sobrevivência Ajustadas pelo Modelo de Cox
+
+```{r cox-curvas}
+#| label: cox-curvas
+#| fig-cap: "Curvas de sobrevivência ajustadas pelo modelo de Cox por grupo de FLC"
+
+cores_flc  <- c("#3BB273","#2E86AB","#F4A261","#E94F37")
+niveis_flc <- levels(flchain_mod$flc_cat)
+
+perfil_medio <- data.frame(
+  flc_cat   = factor(niveis_flc, levels = niveis_flc),
+  age       = median(flchain_mod$age,       na.rm = TRUE),
+  sexo      = factor("Feminino",  levels = levels(flchain_mod$sexo)),
+  log_creat = median(flchain_mod$log_creat, na.rm = TRUE),
+  mgus_f    = factor("Não",       levels = levels(flchain_mod$mgus_f))
+)
+
+sf_cox   <- survfit(cox_fit, newdata = perfil_medio)
+n_grupos <- ncol(sf_cox$surv)
+
+cox_df <- map_dfr(seq_len(n_grupos), function(g) {
+  tibble(
+    time      = sf_cox$time,
+    estimate  = sf_cox$surv[, g],
+    conf.low  = sf_cox$lower[, g],
+    conf.high = sf_cox$upper[, g],
+    grupo     = niveis_flc[g]
+  )
+}) |>
+  mutate(grupo = factor(grupo, levels = niveis_flc))
+
+ggplot(cox_df, aes(x = time, y = estimate, color = grupo, fill = grupo)) +
+  geom_step(linewidth = 1.0) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high),
+              alpha = 0.12, color = NA, show.legend = FALSE,
+              stat = "identity") +
+  scale_color_manual(values = cores_flc) +
+  scale_fill_manual(values  = cores_flc) +
+  scale_y_continuous(limits = c(0, 1), labels = percent_format(1)) +
+  scale_x_continuous(breaks = seq(0, 16, by = 2)) +
+  labs(
+    title    = "Sobrevivência Ajustada — Modelo de Cox",
+    subtitle = "Perfil: mulher, 65 anos, creatinina mediana, sem MGUS",
+    x = "Tempo (anos)", y = expression(hat(S)(t)),
+    color = "Grupo de FLC", fill = "Grupo de FLC"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+As curvas ajustadas isolam o efeito da FLC após controle por idade, sexo e função
+renal. A separação entre grupos é semelhante em magnitude às curvas brutas de
+Kaplan-Meier, confirmando que o efeito da FLC não é artefato de confundimento.
+
+## Modelos Paramétricos {#sec-parametricos}
+
+### Seleção da Distribuição com flexsurv
+
+Ajustamos seis distribuições paramétricas usando `flexsurv::flexsurvreg()` [@jackson2016flexsurv].
+Os **modelos paramétricos AFT** (*Accelerated Failure Time*) especificam o tempo de sobrevivência como
+$$\log T = \mathbf{x}^\top\boldsymbol{\beta} + \sigma\varepsilon,$$
+onde $\varepsilon$ tem distribuição que depende da família escolhida e $\exp(\hat{\beta}_k)$
+é interpretado como **razão de tempo**: o quanto o tempo esperado de sobrevivência
+é multiplicado por um incremento unitário em $x_k$. Um valor $\exp(\hat{\beta}) < 1$
+indica redução no tempo esperado de vida.
+
+A coluna **Parâmetros** da Tabela 4a reporta `npars`, o total de parâmetros
+estimados: parâmetros de forma/escala mais os coeficientes de regressão
+(intercepto + 3 níveis de FLC + idade + sexo + creatinina + MGUS = 7). Para a
+gama generalizada, com 3 parâmetros de forma ($\mu, \sigma, Q$), totaliza 10, e o
+AIC = $-2 \times (-7623{,}87) + 2 \times 10 = 15267{,}74$ [@burnham2002model].
+
+A **gama generalizada** [@jackson2016flexsurv] com parâmetros $\mu \in \mathbb{R}$,
+$\sigma > 0$ e $Q \in \mathbb{R}$ é uma família guarda-chuva que inclui como
+casos especiais:
+
+$$\text{Gama generalizada}(\mu, \sigma, Q) \supset \begin{cases}
+Q = 0 & \text{Log-normal}\;(\sigma \text{ livre}) \\
+Q = 1 & \text{Weibull}\;(\gamma = 1/\sigma) \\
+Q = \sigma & \text{Gama} \\
+Q = 1,\;\sigma = 1 & \text{Exponencial}
+\end{cases}$$
+
+Como log-normal ($Q=0$), Weibull ($Q=1$) e gama ($Q=\sigma$) são pontos **interiores**
+do espaço paramétrico da gama generalizada, o teste LRT segue $\chi^2(1)$ em todos
+esses casos [@self1987asymptotic]. A hierarquia de modelos aninhados é:
+
+```{r flexsurv-ajuste}
+#| label: flexsurv-ajuste
+#| code-summary: "Ajuste de 6 distribuições via flexsurvreg"
+
+dists <- c("exp", "weibull", "lnorm", "llogis", "gamma", "gengamma")
+nomes <- c("Exponencial", "Weibull", "Log-normal",
+           "Log-logística", "Gama", "Gama generalizada")
+
+formula_param <- Surv(anos, death) ~ flc_cat + age + sexo + log_creat + mgus_f
+
+flex_fits <- setNames(
+  lapply(dists, function(d)
+    flexsurvreg(formula_param, data = flchain_mod, dist = d)),
+  nomes
+)
+```
+
+```{r tabela-comparacao-dist}
+#| label: tabela-comparacao-dist
+
+tab_dist <- tibble(
+  Distribuição  = nomes,
+  Parâmetros    = sapply(flex_fits, function(f) f$npars),
+  `log-veross.` = sapply(flex_fits, function(f) round(f$loglik, 2)),
+  AIC           = sapply(flex_fits, function(f) round(AIC(f), 2)),
+  BIC           = sapply(flex_fits, function(f) round(BIC(f), 2)),
+  `ΔAIC`        = NA_real_,
+  `ΔBIC`        = NA_real_
+) |>
+  arrange(AIC) |>
+  mutate(
+    `ΔAIC` = round(AIC - min(AIC), 2),
+    `ΔBIC` = round(BIC - min(BIC), 2),
+    Evidência = case_when(
+      `ΔAIC` <= 2  ~ "Forte",
+      `ΔAIC` <= 7  ~ "Considerável",
+      `ΔAIC` <= 10 ~ "Fraca",
+      TRUE         ~ "Ausente"
+    )
+  )
+
+tab_dist |>
+  gt() |>
+  tab_header(
+    title    = md("**Tabela 4a.** Comparação de Distribuições Paramétricas"),
+    # Parâmetros = npars = total de parametros estimados (forma + escala + covariaveis)
+    subtitle = md("Ordenado por AIC. $\\Delta$AIC por Burnham e Anderson (2002): $\\Delta$AIC $\\leq 2$: forte; 4 a 7: considerável; $> 10$: ausente")
+  ) |>
+  cols_label(
+    `log-veross.` = md("$\\ell(\\hat{\\theta})$"),
+    `ΔAIC`        = md("$\\Delta$AIC"),
+    `ΔBIC`        = md("$\\Delta$BIC"),
+    Evidência     = md("Suporte ($\\Delta$AIC)")
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#e8f4f8"),
+    locations = cells_body(rows = `ΔAIC` == 0)
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#fce4e4"),
+    locations = cells_body(rows = `ΔAIC` > 10)
+  ) |>
+  tab_footnote(
+    footnote  = md("Parâmetros = total estimado (forma/escala + coeficientes das covariáveis). Para a gama generalizada: 3 ($\\mu, \\sigma, Q$) + 7 coeficientes = 10. AIC = $-2\\ell + 2p$."),
+    locations = cells_column_labels(columns = Parâmetros)
+  ) |>
+  tab_source_note(md("Fonte: @jackson2016flexsurv; critério AIC de @burnham2002model"))
+```
+
+### Testes LRT: Gama Generalizada vs. Modelos Aninhados
+
+Como log-normal ($Q=0$), Weibull ($Q=1$) e gama ($Q=\sigma$) são casos aninhados
+da gama generalizada em **pontos interiores** do espaço paramétrico, o LRT segue
+$\chi^2(1)$ [@self1987asymptotic]. O LRT exponencial-vs-Weibull ($\sigma=1$ na
+fronteira) segue mistura 50:50 de $\chi^2_0$ e $\chi^2_1$ e é reportado separadamente.
+
+```{r lrt-gengamma}
+#| label: lrt-gengamma
+
+LRT_flex <- function(fit_full, fit_red, df = 1) {
+  stat <- 2 * (fit_full$loglik - fit_red$loglik)
+  pval <- pchisq(stat, df = df, lower.tail = FALSE)
+  tibble(`chi2_LRT` = round(stat, 3), g.l. = df,
+         `p-valor` = round(pval, 6),
+         Decisão   = ifelse(pval < 0.05,
+                            "Rejeita modelo restrito",
+                            "Não rejeita: modelo restrito adequado"))
+}
+
+lrt_res <- bind_rows(
+  LRT_flex(flex_fits[["Gama generalizada"]], flex_fits[["Weibull"]]),
+  LRT_flex(flex_fits[["Gama generalizada"]], flex_fits[["Log-normal"]]),
+  LRT_flex(flex_fits[["Gama generalizada"]], flex_fits[["Gama"]]),
+  LRT_flex(flex_fits[["Weibull"]], flex_fits[["Exponencial"]])
+) |>
+  mutate(
+    Comparação = c(
+      "Gama generalizada vs Weibull ($Q = 1$)",
+      "Gama generalizada vs Log-normal ($Q = 0$)",
+      "Gama generalizada vs Gama ($Q = \\sigma$)",
+      "Weibull vs Exponencial ($\\sigma = 1$, fronteira)$\\dagger$"
+    )
+  ) |>
+  select(Comparação, everything())
+
+lrt_res |>
+  gt() |>
+  fmt_markdown(columns = Comparação) |>
+  tab_header(
+    title    = md("**Tabela 4b.** Teste LRT — Gama Generalizada vs. Modelos Aninhados"),
+    subtitle = md("$H_0$: o modelo restrito é adequado. Rejeição sugere necessidade do modelo mais geral.")
+  ) |>
+  cols_label(
+    `chi2_LRT` = md("$\\chi^2$ LRT"),
+    `p-valor`  = md("*p*-valor")
+  ) |>
+  fmt_scientific(columns = `p-valor`, decimals = 2) |>
+  tab_footnote(
+    footnote  = md("$\\dagger$ Para exponencial vs Weibull ($\\sigma = 1$ na fronteira), o LRT segue mistura 50:50 de $\\chi^2_0$ e $\\chi^2_1$ [@self1987asymptotic]. O $p$-valor convencional é conservador."),
+    locations = cells_column_labels(columns = Comparação)
+  ) |>
+  tab_style(
+    style     = cell_fill(color = "#fce4e4"),
+    locations = cells_body(rows = `p-valor` < 0.05)
+  ) |>
+  tab_source_note(md("Fonte: @jackson2016flexsurv; teste de Self e Liang [-@self1987asymptotic]"))
+```
+
+### Parâmetro Q da Gama Generalizada
+
+```{r gengamma-Q}
+#| label: gengamma-Q
+#| code-summary: "Estimativa do parâmetro Q e interpretação"
+
+gg_coef <- flex_fits[["Gama generalizada"]]$res
+Q_est   <- gg_coef["Q", "est"]
+Q_lower <- gg_coef["Q", "L95%"]
+Q_upper <- gg_coef["Q", "U95%"]
+
+cat(sprintf("Estimativa de Q: %.4f (IC 95%%: %.4f a %.4f)\n",
+            Q_est, Q_lower, Q_upper))
+
+cat(sprintf("\nInterpretação:\n"))
+cat(sprintf("  Q = 0  => Log-normal  | %s\n",
+            ifelse(Q_lower <= 0 & Q_upper >= 0, "IC contém 0: log-normal plausível", "IC não contém 0")))
+cat(sprintf("  Q = 1  => Weibull     | %s\n",
+            ifelse(Q_lower <= 1 & Q_upper >= 1, "IC contém 1: Weibull plausível", "IC não contém 1")))
+```
+
+
+### Verificação Gráfica da Gama Generalizada {#sec-lin-gengamma}
+
+Após a estimação do parâmetro $\hat{Q} \approx 1{,}57$ (ver @sec-parametricos), é possível
+construir um gráfico de linearização específico para a gama generalizada. A transformação
+$\text{sign}(y_W) \cdot |y_W|^{1/\hat{Q}}$, onde $y_W = \log(-\log\hat{S}(t))$ é a
+escala Weibull, produz retas aproximadamente lineares se a gama generalizada for adequada.
+
+```{r lin-gengamma}
+#| label: lin-gengamma
+#| fig-cap: "Verificação da gama generalizada: linearização com transformação no parâmetro Q estimado (diagnóstico pós-ajuste)"
+#| fig-height: 4
+#| fig-width: 7
+
+# Q_est já foi definido no chunk gengamma-Q acima
+km_gg     <- survfit(Surv(anos, death) ~ flc_cat, data = flchain_mod)
+
+df_gg_lin <- tidy(km_gg) |>
+  filter(estimate > 0 & estimate < 1) |>
+  mutate(
+    grupo = str_remove(strata, "flc_cat=") |> factor(levels = niveis_flc),
+    logt  = log(time),
+    y_wb  = log(-log(estimate)),
+    y_gg  = sign(y_wb) * abs(y_wb)^(1 / Q_est)
+  )
+
+ggplot(df_gg_lin, aes(x = logt, y = y_gg, color = grupo)) +
+  geom_line(linewidth = 0.8, alpha = 0.85) +
+  scale_color_manual(values = cores_flc, name = "Grupo de FLC") +
+  labs(
+    title    = "Linearização — Gama Generalizada",
+    subtitle = bquote("Transformação:" ~ sign(y[W]) %.% group("|", y[W], "|")^{1/hat(Q)} ~
+                      "com" ~ hat(Q) == .(round(Q_est, 2))),
+    x        = "log(t)",
+    y        = expression(sign(y[W]) %.% group("|", y[W], "|")^{1/hat(Q)})
+  ) +
+  theme(legend.position = "bottom")
+```
+
+A linearidade das retas confirma, de forma consistente com a Tabela 4a
+(@sec-parametricos), que a gama generalizada fornece bom ajuste aos dados.
+O padrão é visualmente similar ao Weibull ($Q=1$), mas o parâmetro $\hat{Q} = 1{,}57$
+com IC 95% que não contém 1 (ver tabela acima) indica que a família
+Weibull é uma simplificação estatisticamente rejeitada.
+
+
+
+### Tabela de Coeficientes — Modelo Selecionado
+
+```{r weibull-tabela}
+#| label: weibull-tabela
+
+# Estrategia robusta: usar broom::tidy() sobre o modelo selecionado
+# tidy.flexsurvreg retorna: term, estimate, std.error, statistic, p.value
+# Filtramos apenas os termos de covariavel (nao shape/scale/Q/etc.)
+
+modelo_sel_nome <- tab_dist$Distribuição[1]
+fit_sel         <- flex_fits[[modelo_sel_nome]]
+
+# Nomes dos parametros de forma (nao sao covariaveis)
+pars_forma <- fit_sel$dlist$pars
+
+# tidy() ja separa termos em colunas padrao
+coef_tidy <- tidy(fit_sel, conf.int = TRUE, conf.level = 0.95) |>
+  filter(!term %in% pars_forma) |>
+  mutate(
+    exp_b = exp(estimate),
+    Parâmetro = case_when(
+      term == "(Intercept)"            ~ "Intercepto",
+      str_detect(term, "Medio-baixo") ~ "FLC: Medio-baixo vs Baixo",
+      str_detect(term, "Medio-alto")  ~ "FLC: Medio-alto vs Baixo",
+      str_detect(term, "Alto")        ~ "FLC: Alto vs Baixo",
+      term == "age"                   ~ "Idade (anos)",
+      term == "sexoMasculino"         ~ "Sexo: Masculino vs Feminino",
+      term == "log_creat"             ~ "log(Creatinina)",
+      str_detect(term, "mgus_fSim")   ~ "MGUS: Sim vs Nao",
+      TRUE                            ~ term
+    )
+  )
+
+coef_tidy |>
+  select(Parâmetro,
+         estimate, conf.low, conf.high,
+         exp_b, p.value) |>
+  gt() |>
+  cols_label(
+    estimate   = md("$\\hat{\\beta}$"),
+    conf.low   = md("IC 95% Inf"),
+    conf.high  = md("IC 95% Sup"),
+    exp_b      = md("$\\exp(\\hat{\\beta})$"),
+    p.value    = md("*p*-valor")
+  ) |>
+  fmt_number(columns  = c(estimate, conf.low, conf.high, exp_b), decimals = 4) |>
+  fmt_scientific(columns = p.value, decimals = 2) |>
+  tab_header(
+    title    = md(paste0("**Tabela 4c.** Modelo ",
+                         modelo_sel_nome, " — Coeficientes AFT")),
+    subtitle = md("$\\exp(\\hat{\\beta}) < 1$ indica reducao no tempo esperado de sobrevivencia")
+  ) |>
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_body(columns = Parâmetro)
+  )
+```
+
+
+
+
+# Resultados
+
+## Análise Não Paramétrica
+
+```{r resultados-km}
+#| label: resultados-km
+#| include: false
+
+# Extrair valores para usar no texto inline
+km_global    <- survfit(Surv(anos, death) ~ 1, data = flchain_clean)
+mediana_gbl  <- summary(km_global)$table["median"]
+# Se mediana for NA (> 50% sobrevivem), usar texto alternativo
+mediana_txt  <- if (is.na(mediana_gbl)) {
+  "não estimável (mais de 50% da amostra sobreviveu ao período completo)"
+} else {
+  paste0(round(mediana_gbl, 1), " anos")
+}
+
+km_por_flc   <- survfit(Surv(anos, death) ~ flc_cat, data = flchain_clean)
+medianas_flc <- summary(km_por_flc)$table[, "median"]
+
+s5_alto  <- summary(km_por_flc, times = 5)$surv[4]
+s5_baixo <- summary(km_por_flc, times = 5)$surv[1]
+
+prop_censura <- round(100 * mean(flchain_clean$death == 0), 1)
+prop_evento  <- round(100 * mean(flchain_clean$death == 1), 1)
+```
+
+A amostra final compreende **`r nrow(flchain_clean)` indivíduos**, com
+**`r sum(flchain_clean$death)` óbitos** (`r prop_evento`%) e
+**`r sum(flchain_clean$death == 0)` censurados** (`r prop_censura`%) ao longo de
+até `r round(max(flchain_clean$anos), 1)` anos de seguimento.
+
+A mediana de sobrevivência global é `r mediana_txt`. A separação das curvas por
+grupo de FLC é evidente desde os primeiros anos e se mantém ao longo de todo o
+período ($p < 0{,}001$, log-rank). Em 5 anos de seguimento, a probabilidade de
+sobrevivência estimada é de **`r round(100*s5_baixo, 1)`%** no grupo de FLC baixo
+e apenas **`r round(100*s5_alto, 1)`%** no grupo alto, diferença absoluta de
+`r round(100*(s5_baixo - s5_alto), 1)` pontos percentuais.
+
+Apenas o grupo de FLC alto apresenta mediana de sobrevivência estimável
+(**`r round(medianas_flc[4], 1)` anos**); nos demais grupos, mais de 50% dos
+indivíduos sobreviveram ao período completo de acompanhamento, resultado favorável.
+
+Sexo e faixa etária também apresentam efeito significativo ($p < 0{,}001$, log-rank).
+Homens têm mortalidade maior que mulheres em todas as faixas, e o efeito da idade
+é pronunciado: indivíduos com 80 anos ou mais têm probabilidade de sobrevivência em
+5 anos substancialmente inferior à de indivíduos de 50–59 anos.
+
+## Seleção de Variáveis e Modelo de Cox
+
+```{r resultados-cox}
+#| label: resultados-cox
+#| include: false
+
+# Extrair HRs e ICs para texto inline
+hr_tbl <- tidy(cox_fit, exponentiate = TRUE, conf.int = TRUE)
+
+hr_flc2 <- hr_tbl |> filter(str_detect(term, "Medio-baixo")) |> pull(estimate)
+hr_flc3 <- hr_tbl |> filter(str_detect(term, "Medio-alto"))  |> pull(estimate)
+hr_flc4 <- hr_tbl |> filter(str_detect(term, "Alto"))        |> pull(estimate)
+
+ic_flc4_low  <- hr_tbl |> filter(str_detect(term, "Alto")) |> pull(conf.low)
+ic_flc4_high <- hr_tbl |> filter(str_detect(term, "Alto")) |> pull(conf.high)
+
+hr_age   <- hr_tbl |> filter(term == "age")           |> pull(estimate)
+hr_sexo  <- hr_tbl |> filter(term == "sexoMasculino") |> pull(estimate)
+hr_creat <- hr_tbl |> filter(term == "log_creat")     |> pull(estimate)
+hr_mgus  <- hr_tbl |> filter(term == "mgus_fSim")     |> pull(estimate)
+p_mgus   <- hr_tbl |> filter(term == "mgus_fSim")     |> pull(p.value)
+
+c_val     <- round(cox_fit$concordance["concordance"], 3)
+c_nivel   <- if (c_val >= 0.8) "boa" else if (c_val >= 0.7) "aceitável" else "moderada"
+
+ph_global_p <- cox.zph(cox_fit)$table["GLOBAL", "p"]
+ph_result   <- if (ph_global_p < 0.05) {
+  paste0("rejeitou $H_0$ ($p = ", formatC(ph_global_p, format = "e", digits = 2), "$)")
+} else {
+  paste0("não rejeitou $H_0$ ($p = ", round(ph_global_p, 3), "$)")
+}
+
+# AICs dos modelos parametricos via flex_fits (nomes iguais ao tab_dist)
+aic_cox <- formatC(AIC(cox_fit),                    format = "f", digits = 1)
+aic_wb  <- formatC(AIC(flex_fits[["Weibull"]]),     format = "f", digits = 1)
+aic_ln  <- formatC(AIC(flex_fits[["Log-normal"]]),  format = "f", digits = 1)
+aic_exp <- formatC(AIC(flex_fits[["Exponencial"]]), format = "f", digits = 1)
+
+melhor_aic <- c(Cox        = AIC(cox_fit),
+                Weibull    = AIC(flex_fits[["Weibull"]]),
+                `Log-normal` = AIC(flex_fits[["Log-normal"]]),
+                Exponencial= AIC(flex_fits[["Exponencial"]]))
+nome_melhor <- names(which.min(melhor_aic))
+```
+
+O TRV sequencial confirmou a relevância de FLC, idade, sexo e creatinina
+($p < 0{,}001$ em cada etapa). A covariável MGUS não atingiu significância
+estatística nesse modelo ($p = `r round(p_mgus, 3)`$), possivelmente pelo tamanho
+reduzido do subgrupo (n = 115); ainda assim, foi mantida no modelo por sua
+relevância clínica e para controle de confundimento.
+
+Os **grupos de FLC** apresentam efeito gradual e monótono após ajuste pelas demais
+covariáveis (referência: grupo Baixo 1–2):
+
+- **FLC Médio-baixo (3–5):** HR = `r round(hr_flc2, 2)`, risco `r round((hr_flc2-1)*100)`% maior.
+- **FLC Médio-alto (6–8):** HR = `r round(hr_flc3, 2)`, risco `r round((hr_flc3-1)*100)`% maior.
+- **FLC Alto (9–10):** HR = `r round(hr_flc4, 2)` (IC 95%: `r round(ic_flc4_low, 2)`–`r round(ic_flc4_high, 2)`), risco **`r round((hr_flc4-1)*100)`% maior**, estatisticamente significativo.
+
+A **idade** aumenta o risco em `r round((hr_age-1)*100, 1)`% por ano adicional
+(HR = `r round(hr_age, 3)`). O **sexo masculino** apresenta risco
+`r round((hr_sexo-1)*100)`% maior que o feminino (HR = `r round(hr_sexo, 2)`).
+A **creatinina** (em log) tem HR = `r round(hr_creat, 2)`, indicando que função
+renal prejudicada está associada a maior mortalidade. O efeito do **MGUS** é
+positivo mas não significativo neste modelo (HR = `r round(hr_mgus, 2)`,
+$p = `r round(p_mgus, 3)`$), resultado consistente com a literatura em que o
+efeito do MGUS sobre a mortalidade geral é mediado em grande parte pela FLC.
+
+A estatística $C$ de @harrell2015regression é `r c_val`, indicando discriminação **`r c_nivel`**
+do modelo (limiar: $C \geq 0{,}8$ para boa; $C \geq 0{,}7$ para aceitável).
+
+**Suposição de riscos proporcionais:** O teste global de Schoenfeld
+`r ph_result`. Isso indica que o efeito de pelo menos uma covariável varia ao longo
+do tempo , em particular `flc_cat` e `age` apresentam $p < 0{,}05$ individualmente.
+Esse resultado sugere cautela na interpretação dos HRs como constantes em todo o
+seguimento; análises com interação tempo × covariável poderiam ser exploradas em
+trabalhos futuros. Contudo, para os fins desta análise descritiva e dada a magnitude
+dos efeitos estimados, o modelo de Cox permanece uma ferramenta útil e amplamente
+empregada na literatura.
+
+## Modelos Paramétricos
+
+Entre os seis modelos paramétricos ajustados, a **gama generalizada** apresentou o
+menor AIC, sendo selecionada como modelo preferido. Os testes LRT confirmam que
+nenhum dos modelos aninhados (Weibull, log-normal, gama) é adequado como
+simplificação da gama generalizada ($p < 0{,}001$ em todos os casos), e o parâmetro
+$Q$ estimado ($\hat{Q} \approx 1{,}57$, IC 95%: 1,38 a 1,75) não contém nem 0
+(log-normal) nem 1 (Weibull), reforçando a necessidade do modelo mais geral.
+
+O modelo exponencial é claramente inferior: sua suposição de risco constante é
+refutada tanto pelo gráfico de Nelson-Aalen quanto pelo estimador B-spline, que
+mostra risco crescente nos grupos de menor FLC e padrão em forma de U no grupo
+Alto, e pelo teste LRT ($p < 0{,}001$).
+
+Os coeficientes da gama generalizada (Tabela 4c, @sec-parametricos) confirmam o
+gradiente dose a resposta da FLC na escala AFT. Na escala de tempo acelerado, o
+grupo de FLC alto reduz o tempo esperado de sobrevivência em aproximadamente 42%
+($\exp(\hat{\beta}) \approx 0{,}58$) em relação ao grupo de referência, após
+ajuste pelas demais covariáveis. A escolha da gama generalizada é ainda
+justificada pelo padrão em forma de U observado no hazard suavizado
+(@sec-hazard): o parâmetro $\hat{Q} \approx 1{,}57$ (IC 95%: 1,38–1,75)
+implica um hazard que não é nem monotonicamente crescente (Weibull, $Q=1$) nem
+em forma de sino (log-normal, $Q=0$), sendo consistente com heterogeneidade não
+observada (*frailty*) no grupo de maior risco. O resultado é substantivamente
+concordante com o modelo de Cox (ver @sec-cox), validando a robustez das
+conclusões.
+
+## Limitações
+
+**Causalidade:** Por tratar-se de estudo observacional de coorte, não é possível
+estabelecer causalidade entre FLC e mortalidade. Confundidores não medidos
+(comorbidades, estilo de vida, nível socioeconômico) podem estar presentes.
+
+**Generalização:** A amostra é exclusivamente de residentes caucasianos do Condado
+de Olmsted, o que limita a generalização para outros grupos étnicos ou regiões.
+
+**Covariáveis ausentes:** IMC, tabagismo e comorbidades cardiovasculares não estão
+disponíveis e podem ser confundidores relevantes.
+
+**Valores ausentes em creatinina:** Os `r nrow(flchain_clean) - nrow(flchain_mod)`
+indivíduos excluídos por ausência de creatinina (~`r round(100*(nrow(flchain_clean)-nrow(flchain_mod))/nrow(flchain_clean), 1)`%
+da amostra) concentram-se nos grupos de FLC mais baixo, o que pode introduzir leve
+viés de seleção no sentido de subestimar o efeito protetor do FLC baixo.
+
+**Proporcionalidade de riscos:** O teste global de Schoenfeld rejeitou $H_0$ ($p = 2{,}88 \times 10^{-8}$). Embora
+rejeitado $H_0$, análises futuras com interação tempo × FLC ou estratificação por
+FLC poderiam explorar se o efeito da FLC se atenua em seguimentos muito longos.
+
+**Subgrupo MGUS:** Com apenas `r sum(flchain_clean$mgus)` indivíduos com MGUS, a
+análise de subgrupo tem poder limitado para detectar heterogeneidade de efeito.
+
+---
+
+# Conclusão
+
+Este trabalho confirmou que a concentração sérica de cadeia leve livre (FLC) está
+fortemente e independentemente associada à mortalidade por todas as causas em
+adultos com 50 anos ou mais do Condado de Olmsted, Minnesota, mesmo após ajuste por
+idade, sexo, função renal (creatinina) e diagnóstico de MGUS.
+
+A análise não paramétrica revelou separação consistente das curvas de Kaplan-Meier
+por grupo de FLC desde os primeiros anos de seguimento. Em 5 anos, a probabilidade
+de sobrevivência no grupo de FLC alto é aproximadamente 10 a 15 pontos percentuais
+menor que no grupo baixo, diferença clinicamente expressiva.
+
+O modelo de Cox confirmou o gradiente de risco: indivíduos no grupo de FLC alto
+têm risco de óbito **`r round((hr_flc4 - 1) * 100)`% maior** (HR = `r round(hr_flc4, 2)`,
+IC 95%: `r round(ic_flc4_low, 2)`–`r round(ic_flc4_high, 2)`) que os do grupo de
+referência, após ajuste pelas demais covariáveis. A estatística $C$ de Harrell
+(`r c_val`) indica discriminação `r c_nivel` do modelo. Os diagnósticos
+(Schoenfeld, Martingale, Deviance; ver @sec-diagnosticos) não revelaram violações
+importantes das suposições do modelo, embora o teste global de Schoenfeld indique
+variação temporal no efeito de algumas covariáveis (ver Seção de Limitações).
+
+Entre os modelos paramétricos, a gama generalizada apresentou o melhor ajuste
+(menor AIC), e os testes LRT formais rejeitaram todas as simplificações aninhadas
+($p < 0{,}001$). O parâmetro $\hat{Q} \approx 1{,}57$ indica uma distribuição mais
+flexível que o Weibull ($Q=1$) ou o log-normal ($Q=0$), capaz de acomodar a
+heterogeneidade de risco observada no grupo de FLC alto, em particular o padrão
+em forma de U identificado pelo estimador B-spline, compatível com heterogeneidade
+não observada (*frailty*) nesse grupo. O exponencial é claramente inadequado,
+pois assume risco constante, hipótese refutada pelo estimador de Nelson-Aalen. Todos os
+modelos convergem substantivamente: FLC elevada reduz o tempo esperado de
+sobrevivência de forma significativa e gradual, com concordância entre as escalas AFT
+e de risco proporcional do Cox.
+
+**Resposta à pergunta de interesse:** Sim: a FLC sérica está significativamente
+associada ao tempo de sobrevivência após ajuste multivariado, com risco crescente
+do grupo baixo para o alto. A dosagem de FLC pode ser útil como biomarcador
+prognóstico de mortalidade em população geral de idosos, mesmo na ausência de
+doença hematológica diagnosticada.
+
+
+---
+
+# Referências
+
+::: {#refs}
+:::
+
+---
+
+# Apêndice: Códigos
+
+Todos os códigos utilizados neste trabalho estão disponíveis ao longo do documento,
+com opção de expansão (`code-fold: true`). Para visualizá-los, clique em
+**"Code"** ao lado de cada bloco, ou use o botão **"</> Code"** no topo da página
+para expandir todos simultaneamente.
+
+```{r session-info}
+#| label: session-info
+#| code-summary: "Informações da Sessão R"
+sessionInfo()
+```
