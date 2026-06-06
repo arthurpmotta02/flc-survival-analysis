@@ -187,7 +187,7 @@ O painel Weibull exibe retas aproximadamente paralelas entre grupos, sugerindo b
 
 O modelo de Cox especifica o hazard condicional como:
 
-$$h(t \mid \mathbf{x}) = h_0(t)\exp\!\left(\beta_1 x_1 + \beta_2 x_2 + \cdots + \beta_p x_p\right)$$
+$$h(t \mid \mathbf{x}) = h_0(t)\exp\left(\beta_1 x_1 + \beta_2 x_2 + \cdots + \beta_p x_p\right)$$
 
 onde $h_0(t)$ é o **hazard de base** (não paramétrico) e $\exp(\hat{\beta}_k)$ é a **razão de riscos** (HR): quanto o risco instantâneo muda por incremento unitário em $x_k$, mantidas as demais covariáveis constantes. O modelo é semiparamétrico pois não impõe forma distribucional a $h_0(t)$.
 
@@ -209,7 +209,7 @@ Gradiente monotônico e crescente da FLC após ajuste multivariado.
 
 **Discriminação:** estatística $C$ de Harrell $= 0{,}788$ — definida como
 
-$$C = P\!\left(\hat{\eta}_i > \hat{\eta}_j \mid T_i < T_j,\; T_i \text{ não censurado}\right)$$
+$$C = P\left(\hat{\eta}_i > \hat{\eta}_j \mid T_i < T_j,\; T_i \text{ não censurado}\right)$$
 
 onde $\hat{\eta}_i = \hat{\boldsymbol{\beta}}^\top \mathbf{x}_i$ é o preditor linear. Discriminação aceitável para modelo de mortalidade por todas as causas em população geral (limiar: $C \geq 0{,}7$).
 
