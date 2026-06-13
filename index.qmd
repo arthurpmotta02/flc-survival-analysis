@@ -3,9 +3,13 @@ title: "Cadeia Leve Livre Sérica e Mortalidade por Todas as Causas"
 subtitle: "Trabalho Final — Análise de Sobrevivência"
 author: "Arthur Pontes Motta"
 date: today
-lang: pt
+lang: pt-BR
+
 bibliography: references.bib
+
+
 csl: https://raw.githubusercontent.com/citation-style-language/styles/master/associacao-brasileira-de-normas-tecnicas.csl
+
 format:
   html:
     toc: true
@@ -21,10 +25,12 @@ format:
       caption: "Mostrar/ocultar todos os códigos"
     fig-align: center
     embed-resources: true
+
 execute:
   echo: true
   warning: false
   message: false
+
 knitr:
   opts_chunk:
     fig.path: "figures/"
@@ -953,7 +959,7 @@ eliminar sequencialmente as não-significativas com $p > 0{,}10$.
 **Passo 3 (forward das descartadas):** reintroduzir individualmente as variáveis
 eliminadas no Passo 1; incluir se $p \leq 0{,}10$.
 
-**Passo 4 (poda final + interações):** stepwise bidirecional com $p_{\rm entrada} = p_{\rm saída} = 0{,}10$;
+**Passo 4 (poda final + interações):** stepwise bidirecional com $p_{\mathrm entrada} = p_{\mathrm saída} = 0{,}10$;
 avaliar interações clinicamente relevantes entre as variáveis no modelo.
 
 ```{r collett-passo1}
